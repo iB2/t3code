@@ -25,3 +25,22 @@ export {
   type MegazordTaskState,
   type FactoryActionableStatus,
 } from "./taskState.ts";
+
+export {
+  megazordSubmitEvents,
+  megazordThreadEventsForTransition,
+  megazordPollShouldStop,
+  type MegazordThreadEvent,
+  type MegazordProgressContext,
+} from "./runtimeEvents.ts";
+
+export {
+  WorktreeManager,
+  WorktreeError,
+  WorktreeGuardrailError,
+  sanitizeThreadRef,
+  extractPrUrl,
+  type WorktreeManagerOptions,
+  type ThreadWorktree,
+  type WorktreeCommandDetail,
+} from "./worktree.ts";

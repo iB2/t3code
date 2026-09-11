@@ -24,8 +24,8 @@ T3 registers harnesses as **`ProviderDriver`** values, not Layers
 
 - **`ProviderDriverKind` is an OPEN branded slug**, not a closed union
   (`packages/contracts/src/providerInstance.ts:18-70`). The design explicitly
-  supports forks adding drivers: *"The server hosts forks, ships in PRs that add
-  drivers … external fork authors retain reasonable freedom."* So
+  supports forks adding drivers: _"The server hosts forks, ships in PRs that add
+  drivers … external fork authors retain reasonable freedom."_ So
   `ProviderDriverKind.make("megazord")` is a first-class extension — **no change
   to the contracts package is required**, and unknown drivers degrade to an
   "unavailable" snapshot rather than crashing.
@@ -69,10 +69,10 @@ Recon of `C:\Users\bruno\Documents\DevProjects\capiva-factory`:
   `evidencia`, `flags` (`internal_isolated`, `external_publish`, …, drive the
   review tier), `channel`, `target_repo`, `by`, `run_id`.
 - **Submit result:** `{ actionable, deduped, paperclip:{ issueId, issueIdent,
-  assignee, assigneeId, url } }`. Idempotent by `dedup_key` (`deduped:true`).
+assignee, assigneeId, url } }`. Idempotent by `dedup_key` (`deduped:true`).
 - **Status/read (no dedicated intake endpoint):**
   - Local store `actionables/store.ndjson`, status enum `pending_founder |
-    dispatched | gate_blocked_escalated | resolved | dropped`.
+dispatched | gate_blocked_escalated | resolved | dropped`.
   - Paperclip live: `GET http://127.0.0.1:3100/api/issues/:issueId` → `.status`
     (and heartbeat-run endpoints for worker execution state).
 - **Auth:** none against the local instance — Paperclip runs in
@@ -90,61 +90,98 @@ vocabularies onto one stable `MegazordTaskState`
 
 ## What is build-verified vs runtime-untested
 
-- **Verified (typecheck):** `packages/megazord/src/**` compiles clean under the
-  repo's exact strict flags (`strict`, `exactOptionalPropertyTypes`,
-  `noUncheckedIndexedAccess`, `verbatimModuleSyntax`, `erasableSyntaxOnly`,
-  `NodeNext`). Command used (isolated dir, `typescript@5.9.2` + `@types/node@24.12.4`):
-  `tsc -p tsconfig.json` → **pass, 0 errors**.
-- **NOT verified — driver blueprint:** `blueprint/MegazordDriver.ts` is written
-  against the real SPI but has **not** been compiled in-tree (would require a
-  full monorepo install).
+- **Verified (leaf typecheck, isolated):** `packages/megazord/src/**` compiles
+  clean under the repo's exact strict flags (`strict`,
+  `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`,
+  `verbatimModuleSyntax`, `erasableSyntaxOnly`, `NodeNext`) via an **isolated
+  `tsc`** (no `@effect/language-service` plugin — the plugin bans raw node
+  builtins, which the framework-agnostic transport/worktree code uses by
+  design, exactly like `MegazordIntakeClient.ts`).
+- **Verified (unit tests):** `runtimeEvents.test.ts` + `worktree.test.ts` →
+  **17 passing** (`vitest run`), covering the state→event projection and the
+  worktree branch/path derivation + PR-url parsing.
+- **Verified (in-tree, Build 3):** the LIVE driver
+  `apps/server/src/provider/Drivers/MegazordDriver.ts` compiles under the FULL
+  server package typecheck **with** the Effect language-service plugin active:
+  `pnpm --filter t3 typecheck` → **0 errors, 0 warnings**. It is registered in
+  `builtInDrivers.ts` (also green).
 - **NOT verified — runtime round-trip:** nothing was executed against the live
-  factory. Per the spike constraints the T3 GUI/app was never launched and the
+  factory. Per the harness constraints the T3 GUI/app was never launched and the
   running Megazord on `:3100` was never touched. A real submit→issue→status
-  round-trip must be run by a human.
+  round-trip must be run by a human (Bruno).
 
-## Why a blueprint (not a live driver file)
+## Framework-agnostic bridge + Effect driver (the two-layer split)
 
-Any file under `apps/server/src` is included in that app's typecheck. An
-Effect-TS driver imports `@t3tools/contracts`, `effect/*`, and server-internal
-modules, so verifying it needs `node_modules` for the whole workspace
-(Electron/Expo/native deps + a `prepare` step). This spike deliberately did not
-run that install (heavy on Windows; the app must never be launched). Shipping
-the driver as a blueprint keeps the repo's typecheck green while still handing
-over the complete, wired implementation.
+Any file under `apps/server/src` is typechecked WITH the
+`@effect/language-service` plugin, which forbids raw node builtins
+(`nodeBuiltinImport`), `Date`/`setTimeout`/`fetch`/`crypto.randomUUID`, etc. So
+the split is deliberate:
+
+- **`packages/megazord/src/**` (framework-agnostic):** all Node I/O — spawning
+  the intake CLI, `git`/`gh` for worktrees, HTTP status reads — plus the PURE
+  state→event decision (`runtimeEvents.ts`). Verified by isolated `tsc` + unit
+  tests. Reused verbatim by the driver.
+- **`apps/server/src/provider/Drivers/MegazordDriver.ts` (Effect, in-tree):**
+  stays plugin-clean — mints ids from a counter, timestamps via `DateTime`, and
+  drives the leaf classes through `Effect.tryPromise`. Owns the adapter, the
+  Queue-backed `streamEvents`, the poll→event pump, and the snapshot/text-gen
+  stubs.
+
+The old `blueprint/MegazordDriver.ts` (which left the adapter seams as
+`notImplemented`) is **superseded and removed** by this live driver.
 
 ---
 
-## Activating the driver (remaining steps to a full round-trip)
+## Activating the driver — DONE in Build 3
 
-1. **Move the blueprint in:**
-   `packages/megazord/blueprint/MegazordDriver.ts` →
-   `apps/server/src/provider/Drivers/MegazordDriver.ts`, and fix the import of
-   the bridge (`@t3tools/megazord`) — add `@t3tools/megazord` to
-   `apps/server/package.json` dependencies (`"@t3tools/megazord": "workspace:*"`).
-2. **Register it** in `apps/server/src/provider/builtInDrivers.ts`:
-   ```ts
-   import { MegazordDriver, type MegazordDriverEnv } from "./Drivers/MegazordDriver.ts";
-   // add MegazordDriverEnv to the BuiltInDriversEnv union
-   // add MegazordDriver to the BUILT_IN_DRIVERS array
-   ```
-3. **Fill the TODO seams** using `OpenCodeAdapter`/`OpenCodeProvider` as the
-   reference:
-   - `startSession`: call `client.submit(...)`, return a real `ProviderSession`,
-     and start a poll loop that maps `MegazordTaskState` transitions into
-     `ProviderRuntimeEvent`s on `streamEvents`.
-   - `sendTurn`: submit a follow-up `pedido` (or reject if the factory model is
-     one-shot per issue).
-   - `readThread` / `rollbackThread` / `snapshot` / `textGeneration`: implement
-     or return a principled "unsupported".
-4. **Typecheck the server package:** `pnpm --filter t3 typecheck`
-   (do **not** run `pnpm dev` / launch the app).
+Steps 1-4 below are implemented and typecheck-green; only 5-6 remain (human).
+
+1. ~~Move the blueprint in~~ → **done**: live at
+   `apps/server/src/provider/Drivers/MegazordDriver.ts`; `@t3tools/megazord`
+   added to `apps/server/package.json` (`workspace:*`).
+2. ~~Register it~~ → **done** in `builtInDrivers.ts` (`MegazordDriver` +
+   `MegazordDriverEnv` = `never`).
+3. ~~Fill the seams~~ → **done**:
+   - `startSession`: provisions the thread's isolated worktree+branch
+     (`WorktreeManager.ensureThreadWorktree`), builds a real `ProviderSession`,
+     emits `session.started`.
+   - `sendTurn`: `client.submit(...)` → factory `[INTAKE]` issue, emits
+     `turn.started`, then forks a **poll loop** that maps each
+     `MegazordTaskState` transition into `ProviderRuntimeEvent`s
+     (`item.completed`/`turn.completed`) on the Queue-backed `streamEvents`.
+   - `readThread`/`rollbackThread`/approvals/user-input: principled
+     "unsupported" (org-side execution). `snapshot`: static available snapshot.
+     `textGeneration`: fails with `TextGenerationError` (no local text gen).
+4. ~~Typecheck the server package~~ → **done**: `pnpm --filter t3 typecheck`
+   passes (do **not** run `pnpm dev` / launch the app).
 5. **Configure an instance** in `ServerSettings.providerInstances`:
    ```jsonc
-   { "megazord": { "driver": "megazord",
-     "config": { "factoryDir": "C:\\Users\\bruno\\Documents\\DevProjects\\capiva-factory" } } }
+   {
+     "megazord": {
+       "driver": "megazord",
+       "config": {
+         "factoryDir": "C:\\Users\\bruno\\Documents\\DevProjects\\capiva-factory",
+         "repoDir": "C:\\path\\to\\the\\repo\\the\\threads\\work\\on",
+         "baseBranch": "main",
+         "pollIntervalMs": 5000,
+       },
+     },
+   }
    ```
+   Leave `repoDir` empty to disable worktree provisioning (intake round-trip
+   still works; the thread's `cwd` falls back to the session input).
 6. **Human round-trip test (Bruno):** with capiva-factory already running on
    `:3100`, start T3 yourself, pick the **Megazord** harness for a thread, send a
    task, and confirm a `[INTAKE] …` issue appears in Paperclip and the thread
-   reflects the status projection.
+   reflects the status projection as it advances.
+
+## Worktree-per-thread guardrail (control-plane over Paperclip)
+
+`WorktreeManager` (`src/worktree.ts`) gives each thread its own git worktree +
+branch (`megazord/thread-<slug>`) forked from `baseBranch`, in a sibling dir so
+the base checkout stays clean. It is **PR-only by construction**: `commitAll`
+and `pushBranch` refuse to run on the base branch (`WorktreeGuardrailError`),
+`pushBranch` pins the refspec to the thread branch, and `openPullRequest` always
+targets `baseBranch` via `gh pr create` and **never merges** — matching the hard
+"branch → PR → the human clicks merge" rule. The driver provisions the worktree
+on `startSession`; `openPullRequest` is the 1-button-PR affordance.
