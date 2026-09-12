@@ -63,6 +63,36 @@ export {
 } from "./runtimeEvents.ts";
 
 export {
+  MegazordT3DispatchClient,
+  MegazordDispatchError,
+  selectInstance,
+  parseAccounts,
+  readAccounts,
+  resolveOrigin,
+  defaultBaseDir,
+  defaultServerBinPath,
+  serverRuntimeStatePath,
+  settingsPath,
+  defaultSsbMatcher,
+  DEFAULT_MODEL_BY_DRIVER,
+  type ProviderDriver,
+  type DispatchScope,
+  type RuntimeMode,
+  type InteractionMode,
+  type ProviderInstanceAccount,
+  type InstanceUsage,
+  type InstanceCapabilities,
+  type UsageSource,
+  type SsbMatcher,
+  type SelectInstanceInput,
+  type DispatchDecision,
+  type DispatchRequest,
+  type DispatchOutcome,
+  type MegazordT3DispatchClientOptions,
+  type MintTokenCommand,
+} from "./dispatch.ts";
+
+export {
   WorktreeManager,
   WorktreeError,
   WorktreeGuardrailError,
