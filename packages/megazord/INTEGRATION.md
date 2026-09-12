@@ -97,9 +97,12 @@ vocabularies onto one stable `MegazordTaskState`
   `tsc`** (no `@effect/language-service` plugin — the plugin bans raw node
   builtins, which the framework-agnostic transport/worktree code uses by
   design, exactly like `MegazordIntakeClient.ts`).
-- **Verified (unit tests):** `runtimeEvents.test.ts` + `worktree.test.ts` →
-  **17 passing** (`vitest run`), covering the state→event projection and the
-  worktree branch/path derivation + PR-url parsing.
+- **Verified (unit tests):** `runtimeEvents.test.ts`, `worktree.test.ts`,
+  `taskState.test.ts`, plus Build 4 `intervene.test.ts`, `observe.test.ts`,
+  `router.test.ts` → **52 passing** (`vp test run`), covering the state→event
+  projection, worktree derivation + PR-url parsing, the fail-closed intervene
+  planner/client (mocked fetch), the richer observation extraction, and the
+  cockpit machine router.
 - **Verified (in-tree, Build 3):** the LIVE driver
   `apps/server/src/provider/Drivers/MegazordDriver.ts` compiles under the FULL
   server package typecheck **with** the Effect language-service plugin active:
@@ -174,6 +177,68 @@ Steps 1-4 below are implemented and typecheck-green; only 5-6 remain (human).
    `:3100`, start T3 yourself, pick the **Megazord** harness for a thread, send a
    task, and confirm a `[INTAKE] …` issue appears in Paperclip and the thread
    reflects the status projection as it advances.
+
+## Build 4 — BIDIRECTIONAL round-trip + T3 cockpit (observe + intervene + route)
+
+Build 3 gave the OBSERVE leg (factory state → thread) and worktree-per-thread.
+Build 4 completes the control-plane the DISTRIBUTION-PLAN "Plano de CONTROLE"
+asked for: richer observe, a bidirectional intervene channel, and the cockpit
+routing model.
+
+### What is build-verified (typecheck + unit tests, no live factory)
+
+- **OBSERVE (richer)** — `observe.ts` + `MegazordIntakeClient.getIssueObservation`
+  read a live Paperclip issue into `{ state, rawStatus, phase?, agent?, cost?,
+risk? }` (best-effort, never throws on a garbage body). The driver's poll loop
+  now uses it, so a dispatched note reads e.g. `Dispatched … — phase: review ·
+agent: narrative · cost: $0.42 · risk: tier 2`.
+- **INTERVENE (bidirectional)** — `intervene.ts` is the T3→thread control leg:
+  - `respondToUserInput` → **inject** a message (redirect the agent mid-flight);
+  - `interruptTurn` → **pause** (interrupt the local poll + best-effort upstream);
+  - `stopSession` → **kill** (best-effort upstream, then tear down local state);
+  - `respondToRequest` → **approve/reject** an escalated gate
+    (`accept*`→approve, `decline`/`cancel`→reject).
+    Every intervention lands as a **visible issue comment** carrying a
+    machine-readable marker (`[T3-COCKPIT mz:redirect=1 …]`) — same "make it
+    visible, never a shadow subagent" rule as dispatch. **Fail-closed:** the pure
+    `planIntervention` refuses (no network) when there is no live issue + company
+    scope, or an empty inject; the client just executes a validated plan. The
+    whole path is unit-verified with an **injected `fetchImpl`**, so nothing here
+    ever touched `:3100`.
+- **COCKPIT routing (1 cockpit → N machines)** — `router.ts`
+  (`MegazordMachineRouter`) is the "machine + account per request" interface:
+  register N targets, `resolve(request)` picks one (explicit id, or the
+  default), fail-closed on unknown/none. The driver registers **this** machine
+  as a `local` target and dispatches to it (the build-verified ≥1-machine path);
+  `requireLocal` fails closed on a `remote` target because the mesh transport
+  (Remote Control) is not wired in-process.
+
+### What is runtime-untested (needs Bruno, live, on the Mac test)
+
+- The **wire format** of intervene comments against the real Paperclip API. The
+  comment endpoint shape (`POST /api/companies/<companyId>/issues/<id>/comments`)
+  mirrors the intake POST path (`/api/companies/<co>/issues`), but the exact
+  comment field/route must be confirmed against the running factory; both are
+  overridable via `InterveneEndpoints` if they differ.
+- Whether the org agent **honours the `mz:` markers** (redirect / gate / control)
+  — that is factory-side behaviour, not verified here.
+- **Multi-machine** dispatch. The router interface + local path are verified; a
+  **remote** machine needs the mesh/Remote-Control transport, which Bruno wires
+  and validates from the Mac. Until then remote targets fail closed.
+
+### Live validation steps (Bruno, on the Mac test)
+
+1. Configure a `megazord` instance with `factoryDir`, `companyId` (required for
+   intervene — the Paperclip company scope), optional `repoDir`/`baseBranch`,
+   and `machineId`.
+2. With capiva-factory running on `:3100`, start T3 yourself (never launched
+   here), pick the **Megazord** harness, send a task → confirm the `[INTAKE] …`
+   issue appears and the thread shows the richer observe line.
+3. Exercise intervene from the UI: inject a redirect, pause, approve/reject a
+   gate → confirm a `[T3-COCKPIT mz:…]` comment lands on the issue. If the
+   comment route differs, set `InterveneEndpoints.commentPath`/`commentBodyKey`.
+4. For multi-machine: register a second (remote) machine and wire the mesh
+   transport; confirm the cockpit routes a request to it.
 
 ## Worktree-per-thread guardrail (control-plane over Paperclip)
 

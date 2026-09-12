@@ -26,6 +26,7 @@
  * @module megazord/runtimeEvents
  */
 import { isTerminalTaskState, type MegazordTaskState } from "./taskState.ts";
+import { observationDetail } from "./observe.ts";
 
 /**
  * A single thread-facing lifecycle event, provider-agnostic. The driver decides
@@ -60,12 +61,27 @@ export interface MegazordProgressContext {
   readonly issueUrl?: string;
   /** The raw upstream status string that produced the transition, for detail. */
   readonly rawStatus?: string;
+  /** Live lifecycle phase (OBSERVE), when the issue exposes one. */
+  readonly phase?: string;
+  /** Agent/assignee currently on the task (OBSERVE). */
+  readonly agent?: string;
+  /** Cost/usage signal (OBSERVE), when present. */
+  readonly cost?: string;
+  /** Risk/tier signal (OBSERVE), when present. */
+  readonly risk?: string;
 }
 
 function issueSuffix(ctx: MegazordProgressContext | undefined): string {
   if (ctx?.issueIdent !== undefined && ctx.issueIdent !== "") return ` (issue ${ctx.issueIdent})`;
   if (ctx?.issueUrl !== undefined && ctx.issueUrl !== "") return ` (${ctx.issueUrl})`;
   return "";
+}
+
+/** Trailing " — phase: … · agent: … · cost: … · risk: …" detail, or "". */
+function observeSuffix(ctx: MegazordProgressContext | undefined): string {
+  if (ctx === undefined) return "";
+  const detail = observationDetail(ctx);
+  return detail === "" ? "" : ` — ${detail}`;
 }
 
 /**
@@ -107,7 +123,12 @@ export function megazordThreadEventsForTransition(
         ? []
         : [{ kind: "status-note", text: `Re-queued in the org backlog${suffix}.` }];
     case "dispatched":
-      return [{ kind: "status-note", text: `Dispatched — the org is working on it${suffix}.` }];
+      return [
+        {
+          kind: "status-note",
+          text: `Dispatched — the org is working on it${suffix}.${observeSuffix(ctx)}`,
+        },
+      ];
     case "blocked":
       return [
         {

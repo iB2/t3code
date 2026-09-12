@@ -35,14 +35,10 @@ import {
   issueStatusToTaskState,
   type MegazordTaskState,
 } from "./taskState.ts";
+import { observeFromIssue, type MegazordObservation } from "./observe.ts";
 
 /** Domain routing hint understood by capiva-factory intake. */
-export type MegazordDomain =
-  | "conteudo"
-  | "seo-aeo"
-  | "conhecimento"
-  | "ops"
-  | "cross-cutting";
+export type MegazordDomain = "conteudo" | "seo-aeo" | "conhecimento" | "ops" | "cross-cutting";
 
 /**
  * A task submitted to the factory. Mirrors the fields consumed by
@@ -169,7 +165,11 @@ export class MegazordIntakeClient {
     const args = [this.intakeScriptPath(), "--request", JSON.stringify(request), "--json"];
     const { stdout, stderr, code } = await this.run(this.nodeBin, args, this.submitTimeoutMs);
     if (code !== 0) {
-      throw new MegazordIntakeError(`intake CLI exited with code ${code}`, { stdout, stderr, code });
+      throw new MegazordIntakeError(`intake CLI exited with code ${code}`, {
+        stdout,
+        stderr,
+        code,
+      });
     }
     const parsed = parseJsonLoose(stdout);
     if (parsed === undefined || typeof parsed !== "object") {
@@ -198,12 +198,31 @@ export class MegazordIntakeClient {
   }
 
   /**
+   * Read the FULL live observation of a submitted task from the running Paperclip
+   * org server: coarse state plus best-effort phase/agent/cost/risk. Read-only
+   * GET; never mutates the factory. This is the richer OBSERVE surface the cockpit
+   * uses to show what the org is actually doing, not just a coarse state word.
+   */
+  async getIssueObservation(issueId: string): Promise<MegazordObservation> {
+    const url = `${this.baseUrl}/api/issues/${encodeURIComponent(issueId)}`;
+    const res = await fetch(url, { method: "GET", headers: { accept: "application/json" } });
+    if (!res.ok) {
+      throw new MegazordIntakeError(`Paperclip issue GET failed: ${res.status} ${res.statusText}`);
+    }
+    const body = (await res.json()) as Record<string, unknown>;
+    return observeFromIssue(body);
+  }
+
+  /**
    * Read an actionable's current status from the local `actionables/store.ndjson`.
    * Returns `undefined` when no actionable with that id is present.
    *
    * `storePath` defaults to `<factoryDir>/actionables/store.ndjson`.
    */
-  async readActionable(actionableId: string, storePath?: string): Promise<MegazordStatus | undefined> {
+  async readActionable(
+    actionableId: string,
+    storePath?: string,
+  ): Promise<MegazordStatus | undefined> {
     const file = storePath ?? nodePath.join(this.factoryDir, "actionables", "store.ndjson");
     let text: string;
     try {
@@ -216,7 +235,11 @@ export class MegazordIntakeClient {
     for (const line of text.split(/\r?\n/)) {
       if (line.trim() === "") continue;
       const rec = parseJsonLoose(line);
-      if (rec !== undefined && typeof rec === "object" && (rec as Record<string, unknown>)["id"] === actionableId) {
+      if (
+        rec !== undefined &&
+        typeof rec === "object" &&
+        (rec as Record<string, unknown>)["id"] === actionableId
+      ) {
         found = rec as Record<string, unknown>;
       }
     }
@@ -245,13 +268,17 @@ export class MegazordIntakeClient {
       let stderr = "";
       const timer = setTimeout(() => {
         child.kill();
-        reject(new MegazordIntakeError(`intake CLI timed out after ${timeoutMs}ms`, { stdout, stderr }));
+        reject(
+          new MegazordIntakeError(`intake CLI timed out after ${timeoutMs}ms`, { stdout, stderr }),
+        );
       }, timeoutMs);
       child.stdout?.on("data", (d: Buffer) => (stdout += d.toString("utf8")));
       child.stderr?.on("data", (d: Buffer) => (stderr += d.toString("utf8")));
       child.on("error", (err: Error) => {
         clearTimeout(timer);
-        reject(new MegazordIntakeError(`failed to spawn intake CLI: ${err.message}`, { stdout, stderr }));
+        reject(
+          new MegazordIntakeError(`failed to spawn intake CLI: ${err.message}`, { stdout, stderr }),
+        );
       });
       child.on("close", (code: number | null) => {
         clearTimeout(timer);
@@ -291,7 +318,8 @@ function toSubmitResult(parsed: Record<string, unknown>): MegazordSubmitResult {
     throw new MegazordIntakeError("intake result missing actionable.id");
   }
   const status = typeof actionable?.["status"] === "string" ? (actionable["status"] as string) : "";
-  const tier = typeof actionable?.["tier"] === "number" ? (actionable["tier"] as number) : undefined;
+  const tier =
+    typeof actionable?.["tier"] === "number" ? (actionable["tier"] as number) : undefined;
   const deduped = parsed["deduped"] === true;
 
   const ref: MegazordPaperclipRef = {
@@ -313,7 +341,9 @@ function toSubmitResult(parsed: Record<string, unknown>): MegazordSubmitResult {
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+  return value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 /** Build a `{ key: value }` fragment only when the field is a non-empty string. */

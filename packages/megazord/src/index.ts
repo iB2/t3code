@@ -26,6 +26,34 @@ export {
   type FactoryActionableStatus,
 } from "./taskState.ts";
 
+export { observeFromIssue, observationDetail, type MegazordObservation } from "./observe.ts";
+
+export {
+  planIntervention,
+  interveneCommentBody,
+  approvalDecisionToIntervene,
+  MegazordInterveneClient,
+  MegazordInterveneError,
+  MEGAZORD_INTERVENE_KINDS,
+  MEGAZORD_MARKER_PREFIX,
+  type MegazordInterveneAction,
+  type MegazordThreadCoords,
+  type MegazordInterveneResult,
+  type MegazordInterveneClientOptions,
+  type InterveneHttpRequest,
+  type InterveneEndpoints,
+} from "./intervene.ts";
+
+export {
+  MegazordMachineRouter,
+  MegazordRoutingError,
+  requireLocal,
+  type MachineTarget,
+  type MachineKind,
+  type MegazordRouteRequest,
+  type MegazordMachineRouterOptions,
+} from "./router.ts";
+
 export {
   megazordSubmitEvents,
   megazordThreadEventsForTransition,

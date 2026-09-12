@@ -39,12 +39,15 @@ import {
   TextGenerationError,
   TrimmedNonEmptyString,
   TurnId,
+  type ApprovalRequestId,
+  type ProviderApprovalDecision,
   type ProviderInstanceId,
   type ProviderRuntimeEvent,
   type ProviderSendTurnInput,
   type ProviderSession,
   type ProviderSessionStartInput,
   type ProviderTurnStartResult,
+  type ProviderUserInputAnswers,
   type ServerProvider,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -58,14 +61,21 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import {
+  approvalDecisionToIntervene,
   MegazordIntakeClient,
+  MegazordInterveneClient,
+  MegazordMachineRouter,
+  requireLocal,
   WorktreeManager,
   megazordPollShouldStop,
   megazordSubmitEvents,
   megazordThreadEventsForTransition,
+  type MachineTarget,
+  type MegazordInterveneAction,
   type MegazordIntakeRequest,
   type MegazordProgressContext,
   type MegazordTaskState,
+  type MegazordThreadCoords,
   type MegazordThreadEvent,
 } from "@t3tools/megazord";
 
@@ -101,6 +111,15 @@ export const MegazordSettings = Schema.Struct({
   paperclipBaseUrl: Schema.String.pipe(
     Schema.withDecodingDefault(Effect.succeed("http://127.0.0.1:3100")),
   ),
+  /**
+   * Paperclip company scope. REQUIRED for the bidirectional intervene channel
+   * (the comment path is `/api/companies/<companyId>/issues/<id>/comments`);
+   * OBSERVE-only round-trips still work without it. Never defaulted to a literal
+   * id — it is a per-deployment value.
+   */
+  companyId: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+  /** Stable id for this machine in the cockpit's routing table. */
+  machineId: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("local"))),
   repoDir: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   baseBranch: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("main"))),
   pollIntervalMs: Schema.Number.pipe(Schema.withDecodingDefault(Effect.succeed(5_000))),
@@ -148,9 +167,35 @@ export const MegazordDriver: ProviderDriver<MegazordSettings, MegazordDriverEnv>
   defaultConfig: (): MegazordSettings => decodeMegazordSettings({ factoryDir: "" }),
   create: ({ instanceId, displayName, accentColor, enabled, config }) =>
     Effect.gen(function* () {
-      const client = new MegazordIntakeClient({
+      // COCKPIT routing: one cockpit routes N machines. v1 registers THIS machine
+      // as a local target and dispatches everything to it (the "≥1 machine" path,
+      // build-verified). Additional machines register through the same
+      // MegazordMachineRouter interface (unit-verified in router.test.ts); a
+      // remote target's mesh transport is the seam Bruno validates live from the
+      // Mac — `requireLocal` fails closed until then.
+      const localTarget: MachineTarget = {
+        id: config.machineId,
+        kind: "local",
         factoryDir: config.factoryDir,
         paperclipBaseUrl: config.paperclipBaseUrl,
+        ...(config.companyId === "" ? {} : { companyId: config.companyId }),
+        baseBranch: config.baseBranch,
+        ...(config.repoDir === "" ? {} : { repoDir: config.repoDir }),
+      };
+      const router = new MegazordMachineRouter([localTarget], {
+        defaultMachine: config.machineId,
+      });
+      const target = requireLocal(router.resolve());
+
+      const client = new MegazordIntakeClient({
+        factoryDir: target.factoryDir ?? config.factoryDir,
+        paperclipBaseUrl: target.paperclipBaseUrl ?? config.paperclipBaseUrl,
+      });
+      // BIDIRECTIONAL intervene channel (T3 → running thread). Fail-closed: every
+      // action refuses (no network) without a live issue + company scope.
+      const intervene = new MegazordInterveneClient({
+        paperclipBaseUrl: target.paperclipBaseUrl ?? config.paperclipBaseUrl,
+        ...(target.companyId !== undefined ? { companyId: target.companyId } : {}),
       });
       const worktrees =
         config.repoDir === ""
@@ -275,7 +320,17 @@ export const MegazordDriver: ProviderDriver<MegazordSettings, MegazordDriverEnv>
 
       const sessions = new Map<string, SessionRecord>();
 
-      // Read current factory state for a submitted thread (read-only).
+      // The thread's factory/Paperclip coordinates, for the intervene channel.
+      const coordsFor = (rec: SessionRecord): MegazordThreadCoords => ({
+        ...(rec.issueId !== undefined ? { issueId: rec.issueId } : {}),
+        ...(target.companyId !== undefined ? { companyId: target.companyId } : {}),
+        ...(rec.issueIdent !== undefined ? { issueIdent: rec.issueIdent } : {}),
+        ...(rec.actionableId !== undefined ? { actionableId: rec.actionableId } : {}),
+      });
+
+      // Read current factory state for a submitted thread (read-only). Uses the
+      // RICHER observation (phase/agent/cost/risk) when the issue is live so the
+      // cockpit shows what the org is doing, not just a coarse state word.
       const fetchState = (
         rec: SessionRecord,
       ): Effect.Effect<
@@ -284,22 +339,32 @@ export const MegazordDriver: ProviderDriver<MegazordSettings, MegazordDriverEnv>
       > =>
         Effect.tryPromise({
           try: async () => {
-            const ctx: MegazordProgressContext = {
+            const base: MegazordProgressContext = {
               ...(rec.issueIdent !== undefined ? { issueIdent: rec.issueIdent } : {}),
               ...(rec.url !== undefined ? { issueUrl: rec.url } : {}),
             };
             if (rec.issueId !== undefined) {
-              const s = await client.getIssueStatus(rec.issueId);
-              return { state: s.state, ctx: { ...ctx, rawStatus: s.rawStatus } };
+              const o = await client.getIssueObservation(rec.issueId);
+              return {
+                state: o.state,
+                ctx: {
+                  ...base,
+                  rawStatus: o.rawStatus,
+                  ...(o.phase !== undefined ? { phase: o.phase } : {}),
+                  ...(o.agent !== undefined ? { agent: o.agent } : {}),
+                  ...(o.cost !== undefined ? { cost: o.cost } : {}),
+                  ...(o.risk !== undefined ? { risk: o.risk } : {}),
+                },
+              };
             }
             if (rec.actionableId !== undefined) {
               const s = await client.readActionable(rec.actionableId);
               return {
                 state: s?.state ?? "unknown",
-                ctx: { ...ctx, rawStatus: s?.rawStatus ?? "" },
+                ctx: { ...base, rawStatus: s?.rawStatus ?? "" },
               };
             }
-            return { state: "unknown" as MegazordTaskState, ctx };
+            return { state: "unknown" as MegazordTaskState, ctx: base };
           },
           catch: (cause) =>
             new ProviderAdapterRequestError({
@@ -438,14 +503,95 @@ export const MegazordDriver: ProviderDriver<MegazordSettings, MegazordDriverEnv>
           return { threadId, turnId };
         });
 
+      // BIDIRECTIONAL control: push one action into a thread's running Paperclip
+      // issue and surface it as a visible status note. Fail-closed — the intervene
+      // client refuses (no network) without a live issue + company scope.
+      const runIntervene = (
+        threadId: ThreadId,
+        action: MegazordInterveneAction,
+      ): Effect.Effect<void, ProviderAdapterError> =>
+        Effect.gen(function* () {
+          const rec = sessions.get(String(threadId));
+          if (rec === undefined) {
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: DRIVER_KIND,
+              threadId,
+            });
+          }
+          const result = yield* Effect.tryPromise({
+            try: () => intervene.intervene(coordsFor(rec), action),
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: DRIVER_KIND,
+                method: `megazord.intervene.${action.kind}`,
+                detail: "intervention refused or failed",
+                cause,
+              }),
+          });
+          const turnId = rec.turnId ?? TurnId.make("megazord-pending");
+          yield* emit(
+            yield* toEvent(
+              {
+                kind: "status-note",
+                text: `Intervention (${action.kind}) sent to the org: ${result.posted}`,
+              },
+              threadId,
+              turnId,
+            ),
+          );
+        });
+
+      // Extract the text to inject from a structured user-input answer set.
+      const extractUserMessage = (answers: ProviderUserInputAnswers): string | undefined => {
+        for (const key of ["message", "text", "input", "answer", "value"]) {
+          const v = answers[key];
+          if (typeof v === "string" && v.trim() !== "") return v;
+        }
+        for (const v of Object.values(answers)) {
+          if (typeof v === "string" && v.trim() !== "") return v;
+        }
+        return undefined;
+      };
+
+      // (c) approve/reject a gate the org escalated.
+      const respondToRequest = (
+        threadId: ThreadId,
+        _requestId: ApprovalRequestId,
+        decision: ProviderApprovalDecision,
+      ): Effect.Effect<void, ProviderAdapterError> =>
+        runIntervene(threadId, approvalDecisionToIntervene(decision));
+
+      // (a) inject a message into a running thread (redirect the agent mid-flight).
+      const respondToUserInput = (
+        threadId: ThreadId,
+        _requestId: ApprovalRequestId,
+        answers: ProviderUserInputAnswers,
+      ): Effect.Effect<void, ProviderAdapterError> => {
+        const message = extractUserMessage(answers);
+        if (message === undefined) {
+          return Effect.fail(
+            new ProviderAdapterValidationError({
+              provider: DRIVER_KIND,
+              operation: "respondToUserInput",
+              issue: "megazord intervene requires a text answer to inject into the thread",
+            }),
+          );
+        }
+        return runIntervene(threadId, { kind: "inject", message });
+      };
+
+      // (b) pause: interrupt the local poll AND best-effort pause upstream.
       const interruptTurn = (threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>
         Effect.gen(function* () {
           const rec = sessions.get(String(threadId));
           if (rec?.pollFiber !== undefined) yield* Fiber.interrupt(rec.pollFiber);
+          yield* Effect.ignore(runIntervene(threadId, { kind: "pause" }));
         });
 
+      // (b) kill: best-effort kill upstream, then tear down local state.
       const stopSession = (threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>
         Effect.gen(function* () {
+          yield* Effect.ignore(runIntervene(threadId, { kind: "kill" }));
           const rec = sessions.get(String(threadId));
           if (rec?.pollFiber !== undefined) yield* Fiber.interrupt(rec.pollFiber);
           sessions.delete(String(threadId));
@@ -472,8 +618,8 @@ export const MegazordDriver: ProviderDriver<MegazordSettings, MegazordDriverEnv>
         startSession,
         sendTurn,
         interruptTurn,
-        respondToRequest: () => Effect.fail(unsupported("respondToRequest")),
-        respondToUserInput: () => Effect.fail(unsupported("respondToUserInput")),
+        respondToRequest,
+        respondToUserInput,
         stopSession,
         listSessions: () => Effect.sync(() => Array.from(sessions.values(), (r) => r.session)),
         hasSession: (threadId: ThreadId) => Effect.sync(() => sessions.has(String(threadId))),
