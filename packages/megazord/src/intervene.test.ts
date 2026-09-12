@@ -13,16 +13,29 @@ import {
 
 const COORDS: MegazordThreadCoords = {
   issueId: "iss-1",
+  approvalId: "apr-1",
   companyId: "co-1",
-  issueIdent: "PAP-9",
+  issueIdent: "CAPA-9",
   actionableId: "act-1",
 };
 
 describe("planIntervention (fail-closed)", () => {
-  it("refuses (no network) when there is no live issue/company", () => {
-    for (const coords of [{}, { issueId: "iss-1" }, { companyId: "co-1" }]) {
+  it("refuses (no network) an issue-family action with no issueId", () => {
+    for (const coords of [{}, { companyId: "co-1" }, { approvalId: "apr-1" }]) {
       try {
         planIntervention({ kind: "pause" }, coords);
+        throw new Error("expected refusal");
+      } catch (e) {
+        expect(e).toBeInstanceOf(MegazordInterveneError);
+        expect((e as MegazordInterveneError).refusal).toBe(true);
+      }
+    }
+  });
+
+  it("refuses (no network) a gate action with no approvalId", () => {
+    for (const coords of [{}, { issueId: "iss-1" }, { companyId: "co-1" }]) {
+      try {
+        planIntervention({ kind: "approve" }, coords);
         throw new Error("expected refusal");
       } catch (e) {
         expect(e).toBeInstanceOf(MegazordInterveneError);
@@ -40,21 +53,53 @@ describe("planIntervention (fail-closed)", () => {
     }
   });
 
-  it("maps inject to a comment POST on the issue path", () => {
+  it("maps inject to an interrupting comment POST on the issue path", () => {
     const req = planIntervention({ kind: "inject", message: "go left instead" }, COORDS);
     expect(req.method).toBe("POST");
-    expect(req.path).toBe("/companies/co-1/issues/iss-1/comments");
+    expect(req.path).toBe("/issues/iss-1/comments");
     expect(String(req.body["body"])).toContain("go left instead");
     expect(String(req.body["body"])).toContain("mz:redirect=1");
+    expect(req.body["interrupt"]).toBe(true);
+  });
+
+  it("maps pause/resume/kill to tree-holds with the mapped mode", () => {
+    const pause = planIntervention({ kind: "pause" }, COORDS);
+    expect(pause.path).toBe("/issues/iss-1/tree-holds");
+    expect(pause.body["mode"]).toBe("pause");
+    expect(String(pause.body["reason"])).toContain("mz:control=pause");
+
+    expect(planIntervention({ kind: "resume" }, COORDS).body["mode"]).toBe("resume");
+    expect(planIntervention({ kind: "kill" }, COORDS).body["mode"]).toBe("cancel");
+  });
+
+  it("maps approve/reject to the approval decision path", () => {
+    const approve = planIntervention({ kind: "approve" }, COORDS);
+    expect(approve.method).toBe("POST");
+    expect(approve.path).toBe("/approvals/apr-1/approve");
+    expect(String(approve.body["decisionNote"])).toContain("mz:gate=approve");
+
+    const reject = planIntervention({ kind: "reject", note: "not safe" }, COORDS);
+    expect(reject.path).toBe("/approvals/apr-1/reject");
+    expect(String(reject.body["decisionNote"])).toContain("not safe");
   });
 
   it("honours endpoint + body-key overrides", () => {
-    const req = planIntervention({ kind: "pause" }, COORDS, {
-      commentPath: (co, id) => `/x/${co}/${id}/notes`,
+    const inject = planIntervention({ kind: "inject", message: "x" }, COORDS, {
+      commentPath: (id) => `/x/${id}/notes`,
       commentBodyKey: "text",
     });
-    expect(req.path).toBe("/x/co-1/iss-1/notes");
-    expect(req.body["text"]).toBeDefined();
+    expect(inject.path).toBe("/x/iss-1/notes");
+    expect(inject.body["text"]).toBeDefined();
+
+    const pause = planIntervention({ kind: "pause" }, COORDS, {
+      treeHoldPath: (id) => `/x/${id}/holds`,
+    });
+    expect(pause.path).toBe("/x/iss-1/holds");
+
+    const approve = planIntervention({ kind: "approve" }, COORDS, {
+      approvalDecisionPath: (id, decision) => `/x/${id}/${decision}!`,
+    });
+    expect(approve.path).toBe("/x/apr-1/approve!");
   });
 });
 
@@ -101,7 +146,7 @@ describe("MegazordInterveneClient", () => {
     expect(called).toBe(0);
   });
 
-  it("posts a validated comment to the running Paperclip (mocked fetch)", async () => {
+  it("posts an interrupting comment to the running Paperclip (mocked fetch)", async () => {
     let seenUrl = "";
     let seenBody = "";
     const client = new MegazordInterveneClient({
@@ -117,10 +162,25 @@ describe("MegazordInterveneClient", () => {
       { issueId: "iss-1" },
       { kind: "inject", message: "pivot to plan B" },
     );
-    expect(seenUrl).toBe("http://127.0.0.1:3100/api/companies/co-1/issues/iss-1/comments");
+    expect(seenUrl).toBe("http://127.0.0.1:3100/api/issues/iss-1/comments");
     expect(seenBody).toContain("pivot to plan B");
+    expect(seenBody).toContain('"interrupt":true');
     expect(res.action).toBe("inject");
     expect(res.issueId).toBe("iss-1");
+  });
+
+  it("posts a gate decision to the approval path (mocked fetch)", async () => {
+    let seenUrl = "";
+    const client = new MegazordInterveneClient({
+      fetchImpl: (async (url: string) => {
+        seenUrl = url;
+        return new Response(JSON.stringify({ id: "apr-1", status: "approved" }), { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    const res = await client.intervene({ approvalId: "apr-1" }, { kind: "approve" });
+    expect(seenUrl).toBe("http://127.0.0.1:3100/api/approvals/apr-1/approve");
+    expect(res.action).toBe("approve");
+    expect(res.approvalId).toBe("apr-1");
   });
 
   it("surfaces a factory rejection as a non-refusal error", async () => {

@@ -11,24 +11,39 @@
  *   (b) PAUSE / RESUME / KILL the run;
  *   (c) APPROVE / REJECT a gate the org escalated.
  *
- * ## Why every intervention is a VISIBLE issue comment (not a hidden control RPC)
+ * ## Wire-format: the REAL Paperclip primitives (live-verified against :3100)
  *
- * The whole point of Build 3 (DISTRIBUTION-PLAN, "Plano de CONTROLE") is that
- * work stops being a shadow subagent and becomes a **visible Paperclip thread**.
- * Intervention must obey the same rule: it lands as a comment on the issue that
- * everyone (T3, Paperclip UI, the org agent) can see, carrying a machine-readable
- * marker (`mz:...`) the org honours. That keeps the audit trail honest and avoids
- * inventing speculative hidden control endpoints on the factory. The only Paperclip
- * write surface this needs is the one already proven by intake: an issue exists
- * under `/api/companies/:companyId/issues/:issueId`, and comments hang off it.
+ * The first cut of this module assumed a single write surface —
+ * `POST /companies/:co/issues/:id/comments`. That company-scoped comment route
+ * **does not exist** on Paperclip. Live testing against the running org server
+ * (v0.3.1, `local_trusted`) mapped every intervention onto the primitives the
+ * factory actually exposes (all under `/api`, none company-scoped):
+ *
+ *  - INJECT   → `POST /issues/:id/comments` with `{ body, interrupt: true }`.
+ *               Posts a VISIBLE comment carrying the machine-readable `mz:` marker
+ *               AND, because the caller is the board actor (implicit in
+ *               `local_trusted`), cancels the issue's active run — a real
+ *               mid-flight redirect. `interrupt` is a no-op when nothing is
+ *               running, so the comment still lands as an audit marker.
+ *  - PAUSE    → `POST /issues/:id/tree-holds` with `{ mode: "pause", reason }`.
+ *  - RESUME   → `POST /issues/:id/tree-holds` with `{ mode: "resume", reason }`.
+ *  - KILL     → `POST /issues/:id/tree-holds` with `{ mode: "cancel", reason }`.
+ *  - APPROVE  → `POST /approvals/:approvalId/approve` with `{ decisionNote }`.
+ *  - REJECT   → `POST /approvals/:approvalId/reject`  with `{ decisionNote }`.
+ *
+ * The `mz:` marker (see {@link interveneCommentBody}) rides in the comment
+ * `body` / hold `reason` / approval `decisionNote` so the audit trail is honest
+ * and correlatable across T3, the Paperclip UI, and the org agent — the same
+ * "visible, not hidden RPC" intent, now expressed with the endpoints that exist.
  *
  * ## Fail-closed by construction
  *
- * A control action with no live thread/issue, no company scope, or an empty
- * payload is REFUSED before any network call ({@link MegazordInterveneError}).
- * You can never "intervene" into the void, and you can never inject an empty
- * redirect. The pure {@link planIntervention} enforces this and is unit-tested
- * without I/O; {@link MegazordInterveneClient} just executes a validated plan.
+ * A control action with no target is REFUSED before any network call
+ * ({@link MegazordInterveneError}): the issue-family actions (inject / pause /
+ * resume / kill) need a live `issueId`; the gate actions (approve / reject) need
+ * an `approvalId`; `inject` additionally needs a non-empty message. The pure
+ * {@link planIntervention} enforces this and is unit-tested without I/O;
+ * {@link MegazordInterveneClient} just executes a validated plan.
  *
  * Framework-agnostic plain Node (like `MegazordIntakeClient`) so it typechecks in
  * this leaf package and is reused verbatim by the in-tree `MegazordDriver`.
@@ -55,13 +70,32 @@ export const MEGAZORD_INTERVENE_KINDS = [
   "reject",
 ] as const;
 
+/** Action kinds routed through the issue tree-hold primitive, and their mode. */
+const TREE_HOLD_MODE: Readonly<Record<"pause" | "resume" | "kill", "pause" | "resume" | "cancel">> =
+  {
+    pause: "pause",
+    resume: "resume",
+    kill: "cancel",
+  };
+
 /** Where an intervention lands: the thread's factory/Paperclip coordinates. */
 export interface MegazordThreadCoords {
-  /** Paperclip issue id (required — no issue, no intervention). */
+  /**
+   * Paperclip issue id — the target of the issue-family actions (inject / pause
+   * / resume / kill). Without it those actions refuse (no live thread).
+   */
   readonly issueId?: string;
-  /** Paperclip company scope for the issue path (required). */
+  /**
+   * Paperclip approval id — the target of the gate actions (approve / reject).
+   * The org escalates a gate as an approval; without this id a gate refuses.
+   */
+  readonly approvalId?: string;
+  /**
+   * Paperclip company scope. Not part of any intervene path (the real endpoints
+   * are not company-scoped) — retained for correlation/observe parity only.
+   */
   readonly companyId?: string;
-  /** Human issue ident (e.g. `PAP-42`), used only for messages. */
+  /** Human issue ident (e.g. `CAPA-86`), used only for messages. */
   readonly issueIdent?: string;
   /** Local actionable id, echoed into the marker for correlation. */
   readonly actionableId?: string;
@@ -70,7 +104,7 @@ export interface MegazordThreadCoords {
 /** A validated, ready-to-send HTTP request (relative to the `/api` base). */
 export interface InterveneHttpRequest {
   readonly method: "POST" | "PATCH" | "PUT";
-  /** Path under `/api`, e.g. `/companies/<co>/issues/<id>/comments`. */
+  /** Path under `/api`, e.g. `/issues/<id>/comments` or `/approvals/<id>/approve`. */
   readonly path: string;
   readonly body: Readonly<Record<string, unknown>>;
 }
@@ -78,18 +112,28 @@ export interface InterveneHttpRequest {
 /** Result of a successful intervention. */
 export interface MegazordInterveneResult {
   readonly action: MegazordInterveneAction["kind"];
+  /** The issue id targeted (issue-family actions), or `""` for gate actions. */
   readonly issueId: string;
-  /** The comment body actually posted (the visible marker + text). */
+  /** The approval id targeted (gate actions), or `""` otherwise. */
+  readonly approvalId: string;
+  /** The visible marker text actually sent (comment body / reason / decisionNote). */
   readonly posted: string;
-  /** Whatever the factory returned (comment id, etc.), for callers that need it. */
+  /** Whatever the factory returned (comment/hold/approval object), for callers that need it. */
   readonly raw: unknown;
 }
 
 /** Options overriding the (Paperclip-shaped) endpoint templates. */
 export interface InterveneEndpoints {
-  /** Comment-create path under `/api`. Default Paperclip shape. */
-  readonly commentPath?: (companyId: string, issueId: string) => string;
-  /** JSON key the comment body goes under. Default `"body"`. */
+  /** Issue-comment create path under `/api`. Default `/issues/:id/comments`. */
+  readonly commentPath?: (issueId: string) => string;
+  /** Issue tree-hold create path under `/api`. Default `/issues/:id/tree-holds`. */
+  readonly treeHoldPath?: (issueId: string) => string;
+  /**
+   * Approval decision path under `/api`. Default `/approvals/:id/approve` or
+   * `/approvals/:id/reject` depending on `decision`.
+   */
+  readonly approvalDecisionPath?: (approvalId: string, decision: "approve" | "reject") => string;
+  /** JSON key the injected comment text goes under. Default `"body"`. */
   readonly commentBodyKey?: string;
 }
 
@@ -116,14 +160,22 @@ export class MegazordInterveneError extends Error {
   }
 }
 
-function defaultCommentPath(companyId: string, issueId: string): string {
-  return `/companies/${encodeURIComponent(companyId)}/issues/${encodeURIComponent(issueId)}/comments`;
+function defaultCommentPath(issueId: string): string {
+  return `/issues/${encodeURIComponent(issueId)}/comments`;
+}
+
+function defaultTreeHoldPath(issueId: string): string {
+  return `/issues/${encodeURIComponent(issueId)}/tree-holds`;
+}
+
+function defaultApprovalDecisionPath(approvalId: string, decision: "approve" | "reject"): string {
+  return `/approvals/${encodeURIComponent(approvalId)}/${decision}`;
 }
 
 /** The machine-readable control marker prefix the org agent honours. */
 export const MEGAZORD_MARKER_PREFIX = "mz";
 
-/** Build the visible comment body for an action: a marker line + optional text. */
+/** Build the visible marker text for an action: a marker line + optional text. */
 export function interveneCommentBody(
   action: MegazordInterveneAction,
   coords: MegazordThreadCoords,
@@ -143,43 +195,71 @@ export function interveneCommentBody(
 
 /**
  * Pure planner: turn a control action + thread coordinates into a validated HTTP
- * request, or REFUSE (fail-closed) with a {@link MegazordInterveneError}.
+ * request against the REAL Paperclip primitive, or REFUSE (fail-closed) with a
+ * {@link MegazordInterveneError}.
  *
  * Refusals (never hit the network):
- *  - no `issueId` / `companyId`      → no live thread to intervene on;
- *  - `inject` with empty message     → nothing to redirect with.
+ *  - issue-family action (inject/pause/resume/kill) with no `issueId`;
+ *  - gate action (approve/reject) with no `approvalId`;
+ *  - `inject` with an empty message.
  */
 export function planIntervention(
   action: MegazordInterveneAction,
   coords: MegazordThreadCoords,
   endpoints?: InterveneEndpoints,
 ): InterveneHttpRequest {
-  const issueId = (coords.issueId ?? "").trim();
-  const companyId = (coords.companyId ?? "").trim();
-  if (issueId === "" || companyId === "") {
-    throw new MegazordInterveneError(
-      "refused: no live thread to intervene on (missing issueId/companyId)",
-      { refusal: true },
-    );
+  const bodyKey = endpoints?.commentBodyKey ?? "body";
+  const markerText = interveneCommentBody(action, coords);
+
+  if (action.kind === "approve" || action.kind === "reject") {
+    const approvalId = (coords.approvalId ?? "").trim();
+    if (approvalId === "") {
+      throw new MegazordInterveneError("refused: no gate to decide on (missing approvalId)", {
+        refusal: true,
+      });
+    }
+    const approvalPath = endpoints?.approvalDecisionPath ?? defaultApprovalDecisionPath;
+    return {
+      method: "POST",
+      path: approvalPath(approvalId, action.kind),
+      body: { decisionNote: markerText },
+    };
   }
-  if (action.kind === "inject" && action.message.trim() === "") {
-    throw new MegazordInterveneError("refused: cannot inject an empty message", {
+
+  // Issue-family actions: inject / pause / resume / kill.
+  const issueId = (coords.issueId ?? "").trim();
+  if (issueId === "") {
+    throw new MegazordInterveneError("refused: no live thread to intervene on (missing issueId)", {
       refusal: true,
     });
   }
-  const commentPath = endpoints?.commentPath ?? defaultCommentPath;
-  const bodyKey = endpoints?.commentBodyKey ?? "body";
+  if (action.kind === "inject") {
+    if (action.message.trim() === "") {
+      throw new MegazordInterveneError("refused: cannot inject an empty message", {
+        refusal: true,
+      });
+    }
+    const commentPath = endpoints?.commentPath ?? defaultCommentPath;
+    return {
+      method: "POST",
+      path: commentPath(issueId),
+      body: { [bodyKey]: markerText, interrupt: true },
+    };
+  }
+
+  // pause / resume / kill → issue tree-hold with the mapped mode.
+  const treeHoldPath = endpoints?.treeHoldPath ?? defaultTreeHoldPath;
   return {
     method: "POST",
-    path: commentPath(companyId, issueId),
-    body: { [bodyKey]: interveneCommentBody(action, coords) },
+    path: treeHoldPath(issueId),
+    body: { mode: TREE_HOLD_MODE[action.kind], reason: markerText },
   };
 }
 
 export interface MegazordInterveneClientOptions {
   /** Paperclip org server base URL. Defaults to `http://127.0.0.1:3100`. */
   readonly paperclipBaseUrl?: string;
-  /** Company scope, when not supplied per-call on the coords. */
+  /** Company scope, when not supplied per-call on the coords (correlation only). */
   readonly companyId?: string;
   /** Endpoint template overrides. */
   readonly endpoints?: InterveneEndpoints;
@@ -217,7 +297,7 @@ export class MegazordInterveneClient {
 
   /**
    * Push a control action into a running thread. Fail-closed: refuses (no
-   * network) when there is no live issue/company or nothing to say.
+   * network) when there is no live target (issueId / approvalId) or nothing to say.
    */
   async intervene(
     coords: MegazordThreadCoords,
@@ -256,11 +336,11 @@ export class MegazordInterveneClient {
       );
     }
     const raw = await safeJson(res);
-    const bodyKey = this.endpoints?.commentBodyKey ?? "body";
     return {
       action: action.kind,
       issueId: (resolved.issueId ?? "").trim(),
-      posted: String(plan.body[bodyKey] ?? ""),
+      approvalId: (resolved.approvalId ?? "").trim(),
+      posted: interveneCommentBody(action, resolved),
       raw,
     };
   }

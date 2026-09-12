@@ -112,9 +112,10 @@ export const MegazordSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed("http://127.0.0.1:3100")),
   ),
   /**
-   * Paperclip company scope. REQUIRED for the bidirectional intervene channel
-   * (the comment path is `/api/companies/<companyId>/issues/<id>/comments`);
-   * OBSERVE-only round-trips still work without it. Never defaulted to a literal
+   * Paperclip company scope. Used by DISPATCH/OBSERVE (`/companies/:companyId/...`)
+   * and carried for correlation. The intervene primitives themselves are NOT
+   * company-scoped (`/api/issues/:id/...`, `/api/approvals/:id/...`), so the
+   * bidirectional channel works with or without it. Never defaulted to a literal
    * id — it is a per-deployment value.
    */
   companyId: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
@@ -509,6 +510,7 @@ export const MegazordDriver: ProviderDriver<MegazordSettings, MegazordDriverEnv>
       const runIntervene = (
         threadId: ThreadId,
         action: MegazordInterveneAction,
+        coordsOverride?: Partial<MegazordThreadCoords>,
       ): Effect.Effect<void, ProviderAdapterError> =>
         Effect.gen(function* () {
           const rec = sessions.get(String(threadId));
@@ -519,7 +521,8 @@ export const MegazordDriver: ProviderDriver<MegazordSettings, MegazordDriverEnv>
             });
           }
           const result = yield* Effect.tryPromise({
-            try: () => intervene.intervene(coordsFor(rec), action),
+            try: () =>
+              intervene.intervene({ ...coordsFor(rec), ...(coordsOverride ?? {}) }, action),
             catch: (cause) =>
               new ProviderAdapterRequestError({
                 provider: DRIVER_KIND,
@@ -553,13 +556,19 @@ export const MegazordDriver: ProviderDriver<MegazordSettings, MegazordDriverEnv>
         return undefined;
       };
 
-      // (c) approve/reject a gate the org escalated.
+      // (c) approve/reject a gate the org escalated. The gate is a Paperclip
+      // approval; its decision endpoint is keyed by the approval id, so the
+      // escalation's request id IS the approval id we decide on. Fail-closed:
+      // the intervene planner refuses (no network) if that id is empty, and a
+      // wrong id surfaces as a non-refusal 404 from Paperclip.
       const respondToRequest = (
         threadId: ThreadId,
-        _requestId: ApprovalRequestId,
+        requestId: ApprovalRequestId,
         decision: ProviderApprovalDecision,
       ): Effect.Effect<void, ProviderAdapterError> =>
-        runIntervene(threadId, approvalDecisionToIntervene(decision));
+        runIntervene(threadId, approvalDecisionToIntervene(decision), {
+          approvalId: String(requestId),
+        });
 
       // (a) inject a message into a running thread (redirect the agent mid-flight).
       const respondToUserInput = (

@@ -198,13 +198,15 @@ agent: narrative · cost: $0.42 · risk: tier 2`.
   - `stopSession` → **kill** (best-effort upstream, then tear down local state);
   - `respondToRequest` → **approve/reject** an escalated gate
     (`accept*`→approve, `decline`/`cancel`→reject).
-    Every intervention lands as a **visible issue comment** carrying a
-    machine-readable marker (`[T3-COCKPIT mz:redirect=1 …]`) — same "make it
+    Every intervention carries a machine-readable marker
+    (`[T3-COCKPIT mz:redirect=1 …]`) in whichever visible field the real endpoint
+    exposes (comment body / hold reason / approval decisionNote) — same "make it
     visible, never a shadow subagent" rule as dispatch. **Fail-closed:** the pure
-    `planIntervention` refuses (no network) when there is no live issue + company
-    scope, or an empty inject; the client just executes a validated plan. The
-    whole path is unit-verified with an **injected `fetchImpl`**, so nothing here
-    ever touched `:3100`.
+    `planIntervention` refuses (no network) when the issue-family actions have no
+    `issueId`, when a gate has no `approvalId`, or on an empty inject; the client
+    just executes a validated plan. The whole path is unit-verified with an
+    **injected `fetchImpl`**, so the unit tests never touched `:3100`. See the
+    **Build 4/5 wire-format** section below for the live-verified endpoints.
 - **COCKPIT routing (1 cockpit → N machines)** — `router.ts`
   (`MegazordMachineRouter`) is the "machine + account per request" interface:
   register N targets, `resolve(request)` picks one (explicit id, or the
@@ -215,13 +217,13 @@ agent: narrative · cost: $0.42 · risk: tier 2`.
 
 ### What is runtime-untested (needs Bruno, live, on the Mac test)
 
-- The **wire format** of intervene comments against the real Paperclip API. The
-  comment endpoint shape (`POST /api/companies/<companyId>/issues/<id>/comments`)
-  mirrors the intake POST path (`/api/companies/<co>/issues`), but the exact
-  comment field/route must be confirmed against the running factory; both are
-  overridable via `InterveneEndpoints` if they differ.
 - Whether the org agent **honours the `mz:` markers** (redirect / gate / control)
   — that is factory-side behaviour, not verified here.
+- **End-to-end gate surfacing.** The approval-decision endpoints are live-verified
+  (see Build 4/5), but the OBSERVE leg does not yet surface a Paperclip approval
+  into a T3 `ApprovalRequestId`. `respondToRequest` treats the escalation's
+  request id AS the Paperclip approval id (the natural contract once observe
+  surfaces gates); a mismatched id fails honestly as a non-refusal 404.
 - **Multi-machine** dispatch. The router interface + local path are verified; a
   **remote** machine needs the mesh/Remote-Control transport, which Bruno wires
   and validates from the Mac. Until then remote targets fail closed.
@@ -234,11 +236,53 @@ agent: narrative · cost: $0.42 · risk: tier 2`.
 2. With capiva-factory running on `:3100`, start T3 yourself (never launched
    here), pick the **Megazord** harness, send a task → confirm the `[INTAKE] …`
    issue appears and the thread shows the richer observe line.
-3. Exercise intervene from the UI: inject a redirect, pause, approve/reject a
-   gate → confirm a `[T3-COCKPIT mz:…]` comment lands on the issue. If the
-   comment route differs, set `InterveneEndpoints.commentPath`/`commentBodyKey`.
+3. Exercise intervene from the UI: inject a redirect → confirm a `[T3-COCKPIT
+mz:redirect=1 …]` comment lands on the issue (and the active run is
+   interrupted); pause → confirm a `pause` tree-hold appears; approve/reject a
+   surfaced gate. The endpoints are live-verified below; `InterveneEndpoints`
+   remains the override seam if a future Paperclip version moves them.
 4. For multi-machine: register a second (remote) machine and wire the mesh
    transport; confirm the cockpit routes a request to it.
+
+## Build 4/5 — REAL intervene wire-format (LIVE-verified against `:3100`)
+
+The Build 4 first cut wired every intervention to one assumed surface —
+`POST /api/companies/<co>/issues/<id>/comments`. **That company-scoped comment
+route does not exist on Paperclip.** Build 4/5 remapped each action onto the
+primitives the factory actually exposes and verified them live against the
+running org server (v0.3.1, `local_trusted`, company
+`47ef245e-ff23-41be-a39d-21e4ac66ed2a`). All paths are under `/api` and are
+**not** company-scoped. `local_trusted` gives the caller an implicit **board**
+actor, so no auth headers are needed (same as dispatch).
+
+| Action      | Endpoint (before → after)                                               | Body                                             | Live result                                                                                                                                    |
+| ----------- | ----------------------------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| **inject**  | `POST /companies/:co/issues/:id/comments` → `POST /issues/:id/comments` | `{ body: "<mz marker> <msg>", interrupt: true }` | **201** — comment created; `interrupt` cancels the active run when one exists (board-only), no-op otherwise, so the visible marker still lands |
+| **pause**   | _(same wrong comment path)_ → `POST /issues/:id/tree-holds`             | `{ mode: "pause", reason: "<mz marker>" }`       | **201** — hold `active`                                                                                                                        |
+| **resume**  | → `POST /issues/:id/tree-holds`                                         | `{ mode: "resume", reason }`                     | wire-shape same family as pause (`mode` enum `pause\|resume\|cancel`)                                                                          |
+| **kill**    | → `POST /issues/:id/tree-holds`                                         | `{ mode: "cancel", reason }`                     | wire-shape verified via pause; `cancel` is the same route/mode enum                                                                            |
+| **approve** | → `POST /approvals/:approvalId/approve`                                 | `{ decisionNote: "<mz marker>" }`                | **200** — status→`approved`                                                                                                                    |
+| **reject**  | → `POST /approvals/:approvalId/reject`                                  | `{ decisionNote: "<mz marker>" }`                | **200** — status→`rejected`                                                                                                                    |
+
+Cleanup primitive: a pause/cancel hold is released with
+`POST /issues/:id/tree-holds/:holdId/release` `{ reason }` (**200**,
+status→`released`) — verified live.
+
+**INJECT is resolved, not fail-closed.** The earlier diagnosis ("no issue
+comment exists") was reading the wrong path shape; the **issue-scoped**
+`POST /issues/:id/comments` exists and, with `interrupt: true` + the board
+actor, is a real mid-flight redirect that also leaves the visible `mz:` marker.
+
+**Types:** `MegazordThreadCoords` now carries both `issueId` (issue-family
+targets) and `approvalId` (gate targets). `InterveneEndpoints` exposes
+`commentPath(issueId)`, `treeHoldPath(issueId)`,
+`approvalDecisionPath(approvalId, "approve"|"reject")`, and `commentBodyKey`.
+
+**Live evidence (demo issue for Bruno to inspect in Paperclip):**
+`[T3-COCKPIT DEMO 1789221619]` = issue **CAPA-86**
+(`2844c07b-15b7-44ea-a9f0-25856fc92423`). It shows the injected redirect
+comment, a pause hold (now released), and two resolved test approvals (one
+approved, one rejected). Safe to close.
 
 ## Worktree-per-thread guardrail (control-plane over Paperclip)
 
