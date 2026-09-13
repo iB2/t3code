@@ -204,6 +204,35 @@ function makeFetchStub(): {
         { status: 200, headers: { "content-type": "application/json" } },
       );
     }
+    if (u.includes("/api/orchestration/threads/")) {
+      const threadId = u.slice(u.lastIndexOf("/") + 1);
+      if (threadId === "gone") return new Response("not found", { status: 404 });
+      return new Response(
+        JSON.stringify({
+          thread: {
+            id: threadId,
+            deletedAt: threadId === "deleted" ? "2026-09-13T00:00:00.000Z" : null,
+            archivedAt: null,
+            latestTurn: {
+              turnId: "turn-1",
+              state: "completed",
+              requestedAt: "2026-09-13T00:00:00.000Z",
+            },
+            messages: [
+              { id: "m1", role: "user", text: "oi", turnId: "turn-1", streaming: false },
+              {
+                id: "m2",
+                role: "assistant",
+                text: "resposta",
+                turnId: "turn-1",
+                streaming: false,
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
     if (u.endsWith("/api/orchestration/dispatch")) {
       return new Response(JSON.stringify({ sequence: 4242 }), {
         status: 200,
@@ -383,5 +412,76 @@ describe("model pinning", () => {
       modelSelection: { model: string };
     };
     expect(create.modelSelection.model).toBe("claude-opus-5");
+  });
+});
+
+describe("continuing a thread", () => {
+  it("sends only a turn, keeps the thread, and says it was reused", async () => {
+    const { fetchImpl, calls } = makeFetchStub();
+    const c = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      fetchImpl,
+    });
+    const out = await c.dispatch({
+      task: "segunda mensagem",
+      scope: "general",
+      threadId: "th-existing",
+    });
+    expect(out.reusedThread).toBe(true);
+    expect(out.threadId).toBe("th-existing");
+    expect(out.url).toBe("http://127.0.0.1:3773/env-1/th-existing");
+    const posted = calls.filter((call) => call.url.endsWith("/dispatch"));
+    // No thread.create: the conversation already exists.
+    expect(posted.map((call) => (call.body as { type: string }).type)).toEqual([
+      "thread.turn.start",
+    ]);
+    expect((posted[0]!.body as { threadId: string }).threadId).toBe("th-existing");
+  });
+
+  it("refuses a thread that is gone so the caller can start a fresh one", async () => {
+    const { fetchImpl } = makeFetchStub();
+    const c = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      fetchImpl,
+    });
+    await expect(c.dispatch({ task: "x", scope: "general", threadId: "gone" })).rejects.toThrow(
+      /is not open on this machine/,
+    );
+  });
+
+  it("refuses a deleted thread too", async () => {
+    const { fetchImpl } = makeFetchStub();
+    const c = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      fetchImpl,
+    });
+    await expect(c.dispatch({ task: "x", scope: "general", threadId: "deleted" })).rejects.toThrow(
+      /is not open on this machine/,
+    );
+  });
+
+  it("awaitTurn returns the assistant text of the terminal turn", async () => {
+    const { fetchImpl } = makeFetchStub();
+    const c = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      fetchImpl,
+    });
+    const out = await c.awaitTurn({ threadId: "th-existing", timeoutMs: 5000 });
+    expect(out.state).toBe("completed");
+    expect(out.text).toBe("resposta");
+    expect(out.timedOut).toBe(false);
+    expect(out.url).toBe("http://127.0.0.1:3773/env-1/th-existing");
   });
 });

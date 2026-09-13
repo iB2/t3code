@@ -612,6 +612,8 @@ export interface DispatchOutcome {
   readonly url: string;
   /** What ran: `select` (no dispatch), `create` (thread only), or `full` (thread + first turn). */
   readonly mode: "select" | "create" | "full";
+  /** True when the turn continued an existing thread instead of creating one. */
+  readonly reusedThread?: boolean;
   /** Dispatch sequence of the last command, when a dispatch happened. */
   readonly sequence?: number;
   readonly decision: DispatchDecision;
@@ -633,6 +635,12 @@ export interface DispatchRequest {
   readonly needs?: string;
   /** Pin the model for this thread (validated against the harness's manifest). */
   readonly model?: string;
+  /**
+   * Continue an EXISTING thread instead of creating one: skips `thread.create` and
+   * only starts a turn. This is what makes a chat channel one conversation rather
+   * than a new thread per message. Refused if the thread is gone or deleted.
+   */
+  readonly threadId?: string;
   /** Thread title. Defaults to a truncated task. */
   readonly title?: string;
   /** Runtime mode override for this turn. */
@@ -833,11 +841,43 @@ export class MegazordT3DispatchClient {
       this.token(),
       this.environmentId(),
     ]);
+    const continuing = (request.threadId ?? "").trim();
+    const runtimeMode = request.runtimeMode ?? this.runtimeMode;
+    const interactionMode = request.interactionMode ?? "default";
+
+    if (continuing !== "") {
+      // Continue the conversation: the thread already carries the history, the
+      // provider session and its own runtime mode (the decider ignores a runtime
+      // override on an existing thread), so only the turn is sent.
+      if (!(await this.threadIsOpen(origin, token, continuing))) {
+        throw new MegazordDispatchError(
+          `refused: thread '${continuing}' is not open on this machine (gone or deleted)`,
+          { refusal: true },
+        );
+      }
+      const seq = await this.startTurn(origin, token, {
+        threadId: continuing,
+        task: request.task,
+        decision,
+        runtimeMode,
+        interactionMode,
+      });
+      return {
+        threadId: continuing,
+        instanceId: decision.instanceId,
+        driver: decision.driver,
+        model: decision.model,
+        url: `${origin}/${environmentId}/${continuing}`,
+        mode: "full",
+        sequence: seq,
+        reusedThread: true,
+        decision,
+      };
+    }
+
     const projectId = await this.resolveProjectId(origin, token, request);
     const threadId = this.uuid();
     const title = (request.title ?? request.task).trim().slice(0, 80) || "orchestrated thread";
-    const runtimeMode = request.runtimeMode ?? this.runtimeMode;
-    const interactionMode = request.interactionMode ?? "default";
 
     const createSeq = await this.postDispatch(origin, token, {
       type: "thread.create",
@@ -870,20 +910,12 @@ export class MegazordT3DispatchClient {
       };
     }
 
-    const turnSeq = await this.postDispatch(origin, token, {
-      type: "thread.turn.start",
-      commandId: this.uuid(),
+    const turnSeq = await this.startTurn(origin, token, {
       threadId,
-      message: {
-        messageId: this.uuid(),
-        role: "user",
-        text: request.task,
-        attachments: [],
-      },
-      modelSelection: { instanceId: decision.instanceId, model: decision.model },
+      task: request.task,
+      decision,
       runtimeMode,
       interactionMode,
-      createdAt: this.now(),
     });
 
     return {
@@ -896,6 +928,51 @@ export class MegazordT3DispatchClient {
       sequence: turnSeq,
       decision,
     };
+  }
+
+  /** Send one user turn to a thread (new or continuing). */
+  private async startTurn(
+    origin: string,
+    token: string,
+    input: {
+      readonly threadId: string;
+      readonly task: string;
+      readonly decision: DispatchDecision;
+      readonly runtimeMode: RuntimeMode;
+      readonly interactionMode: InteractionMode;
+    },
+  ): Promise<number> {
+    return this.postDispatch(origin, token, {
+      type: "thread.turn.start",
+      commandId: this.uuid(),
+      threadId: input.threadId,
+      message: {
+        messageId: this.uuid(),
+        role: "user",
+        text: input.task,
+        attachments: [],
+      },
+      modelSelection: {
+        instanceId: input.decision.instanceId,
+        model: input.decision.model,
+      },
+      runtimeMode: input.runtimeMode,
+      interactionMode: input.interactionMode,
+      createdAt: this.now(),
+    });
+  }
+
+  /**
+   * Is this thread still a place a turn can land? A caller holding a remembered
+   * thread id needs to tell "keep the conversation" from "it is gone, start over".
+   */
+  async threadIsOpen(origin: string, token: string, threadId: string): Promise<boolean> {
+    try {
+      const thread = await this.readThread(origin, token, threadId);
+      return thread.deletedAt === null && thread.archivedAt === null;
+    } catch {
+      return false;
+    }
   }
 
   /** Resolve the project id from the request (explicit id, or exact-title match). */
@@ -1002,6 +1079,8 @@ export class MegazordT3DispatchClient {
   ): Promise<{
     readonly latestTurn?: { turnId: string; state: string; requestedAt: string };
     readonly messages: ReadonlyArray<Record<string, unknown>>;
+    readonly deletedAt: string | null;
+    readonly archivedAt: string | null;
   }> {
     const res = await this.httpGet(
       `${origin}/api/orchestration/threads/${encodeURIComponent(threadId)}`,
@@ -1018,7 +1097,11 @@ export class MegazordT3DispatchClient {
     const messages = Array.isArray(thread["messages"])
       ? (thread["messages"] as ReadonlyArray<Record<string, unknown>>)
       : [];
-    if (rawTurn === null || typeof rawTurn !== "object") return { messages };
+    const deletedAt = (thread["deletedAt"] as string | null | undefined) ?? null;
+    const archivedAt = (thread["archivedAt"] as string | null | undefined) ?? null;
+    if (rawTurn === null || typeof rawTurn !== "object") {
+      return { messages, deletedAt, archivedAt };
+    }
     const t = rawTurn as Record<string, unknown>;
     return {
       latestTurn: {
@@ -1027,6 +1110,8 @@ export class MegazordT3DispatchClient {
         requestedAt: String(t["requestedAt"] ?? ""),
       },
       messages,
+      deletedAt,
+      archivedAt,
     };
   }
 

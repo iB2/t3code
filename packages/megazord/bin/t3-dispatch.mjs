@@ -48,6 +48,9 @@ function parseArgs(argv) {
       case "--project-title":
         out.projectTitle = next();
         break;
+      case "--thread":
+        out.threadId = next();
+        break;
       case "--title":
         out.title = next();
         break;
@@ -89,6 +92,8 @@ const HELP = `t3-dispatch — dispatch orchestrator work as a routed T3 thread
   --needs <connector>          require an exclusive connector/MCP
   --project <projectId>        target project id
   --project-title "<title>"    resolve project id by exact title
+  --thread <threadId>          continue an EXISTING thread (one conversation
+                               instead of a new thread per message)
   --mode select|create|full    select = route only (no dispatch, safe for SSB);
                                create = thread.create only (no harness/quota);
                                full = create + first turn (default)
@@ -124,6 +129,7 @@ async function main() {
       ...(args.driver ? { driver: args.driver } : {}),
       ...(args.model ? { model: args.model } : {}),
       ...(args.needs ? { needs: args.needs } : {}),
+      ...(args.threadId ? { threadId: args.threadId } : {}),
       ...(args.projectId ? { projectId: args.projectId } : {}),
       ...(args.projectTitle ? { projectTitle: args.projectTitle } : {}),
       ...(args.title ? { title: args.title } : {}),
@@ -143,7 +149,8 @@ async function main() {
       return;
     }
     process.stdout.write(
-      `dispatched to ${out.instanceId} (${out.driver}, model ${out.model})\n` +
+      `dispatched to ${out.instanceId} (${out.driver}, model ${out.model})` +
+        `${out.reusedThread ? " [continued]" : ""}\n` +
         `why:    ${out.decision.reason}\n` +
         `thread: ${out.threadId}\n` +
         `link:   ${out.url}\n`,
