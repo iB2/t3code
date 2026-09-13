@@ -231,6 +231,46 @@ function resolveModel(
 }
 
 /**
+ * The question a turn is currently blocked on, or undefined when it is not blocked.
+ *
+ * The thread's activity log is the source: `user-input.requested` opens a question and
+ * any later `user-input.*` activity on the same request closes it, so the LAST
+ * user-input activity of the turn decides.
+ */
+export function pendingUserInput(
+  activities: ReadonlyArray<Record<string, unknown>>,
+  turnId: string,
+): PendingUserInput | undefined {
+  const forTurn = activities.filter(
+    (a) =>
+      (turnId === "" || a["turnId"] === turnId) &&
+      String(a["kind"] ?? "").startsWith("user-input."),
+  );
+  const last = forTurn[forTurn.length - 1];
+  if (last === undefined || last["kind"] !== "user-input.requested") return undefined;
+  const payload = last["payload"];
+  if (payload === null || typeof payload !== "object") return undefined;
+  const p = payload as Record<string, unknown>;
+  const requestId = String(p["requestId"] ?? "");
+  if (requestId === "") return undefined;
+  const rawQuestions = Array.isArray(p["questions"]) ? p["questions"] : [];
+  const questions = rawQuestions
+    .filter((q): q is Record<string, unknown> => q !== null && typeof q === "object")
+    .map((q) => ({
+      id: String(q["id"] ?? q["question"] ?? ""),
+      question: String(q["question"] ?? ""),
+      header: String(q["header"] ?? ""),
+      options: (Array.isArray(q["options"]) ? q["options"] : [])
+        .filter((o): o is Record<string, unknown> => o !== null && typeof o === "object")
+        .map((o) => String(o["value"] ?? o["label"] ?? ""))
+        .filter((label) => label !== ""),
+      multiSelect: q["multiSelect"] === true,
+    }))
+    .filter((q) => q.id !== "");
+  return { requestId, questions };
+}
+
+/**
  * Join the assistant text a given turn produced. Streaming placeholders are skipped:
  * a half-written message relayed to a chat reads as a bug.
  */
@@ -660,7 +700,28 @@ export interface DispatchRequest {
 }
 
 /** How a turn ended, from the caller's point of view. */
-export type TurnWaitState = "completed" | "error" | "interrupted" | "running";
+export type TurnWaitState =
+  | "completed"
+  | "error"
+  | "interrupted"
+  | "running"
+  /** The agent asked the human a question and is blocked until it is answered. */
+  | "awaiting-input";
+
+/** One question the agent is blocked on, flattened for a text channel. */
+export interface PendingQuestion {
+  readonly id: string;
+  readonly question: string;
+  readonly header: string;
+  readonly options: ReadonlyArray<string>;
+  readonly multiSelect: boolean;
+}
+
+/** The agent's open question, with the id needed to answer it. */
+export interface PendingUserInput {
+  readonly requestId: string;
+  readonly questions: ReadonlyArray<PendingQuestion>;
+}
 
 /** The result of waiting on a dispatched turn. */
 export interface TurnWaitOutcome {
@@ -674,6 +735,8 @@ export interface TurnWaitOutcome {
   readonly url: string;
   /** True when the wait hit its own ceiling rather than a terminal state. */
   readonly timedOut: boolean;
+  /** Set when `state` is `awaiting-input`: what the agent asked, and how to answer. */
+  readonly pendingInput?: PendingUserInput;
 }
 
 const TERMINAL_TURN_STATES: ReadonlyArray<string> = ["completed", "error", "interrupted"];
@@ -1036,6 +1099,21 @@ export class MegazordT3DispatchClient {
     for (;;) {
       const thread = await this.readThread(origin, token, input.threadId);
       const turn = thread.latestTurn;
+      // A turn that asked the human a question never terminates on its own. Report it
+      // at once: waiting out the ceiling would leave the human staring at silence
+      // while the agent stares at an unanswered question.
+      const pending = pendingUserInput(thread.activities, turn?.turnId ?? "");
+      if (pending !== undefined && turn !== undefined) {
+        return {
+          threadId: input.threadId,
+          turnId: turn.turnId,
+          state: "awaiting-input",
+          text: assistantTextForTurn(thread.messages, turn.turnId),
+          url,
+          timedOut: false,
+          pendingInput: pending,
+        };
+      }
       const fresh =
         turn !== undefined &&
         (sinceMs === undefined ||
@@ -1079,6 +1157,7 @@ export class MegazordT3DispatchClient {
   ): Promise<{
     readonly latestTurn?: { turnId: string; state: string; requestedAt: string };
     readonly messages: ReadonlyArray<Record<string, unknown>>;
+    readonly activities: ReadonlyArray<Record<string, unknown>>;
     readonly deletedAt: string | null;
     readonly archivedAt: string | null;
   }> {
@@ -1097,10 +1176,13 @@ export class MegazordT3DispatchClient {
     const messages = Array.isArray(thread["messages"])
       ? (thread["messages"] as ReadonlyArray<Record<string, unknown>>)
       : [];
+    const activities = Array.isArray(thread["activities"])
+      ? (thread["activities"] as ReadonlyArray<Record<string, unknown>>)
+      : [];
     const deletedAt = (thread["deletedAt"] as string | null | undefined) ?? null;
     const archivedAt = (thread["archivedAt"] as string | null | undefined) ?? null;
     if (rawTurn === null || typeof rawTurn !== "object") {
-      return { messages, deletedAt, archivedAt };
+      return { messages, activities, deletedAt, archivedAt };
     }
     const t = rawTurn as Record<string, unknown>;
     return {
@@ -1110,9 +1192,49 @@ export class MegazordT3DispatchClient {
         requestedAt: String(t["requestedAt"] ?? ""),
       },
       messages,
+      activities,
       deletedAt,
       archivedAt,
     };
+  }
+
+  /**
+   * Answer the question the agent is blocked on, as a human would in the UI.
+   *
+   * The same free-text answer is applied to every question in the request: a chat
+   * channel has one reply box, not a form, and the agent reads prose fine. Option
+   * labels work too — typing a label matches it exactly.
+   */
+  async respondUserInput(input: {
+    readonly threadId: string;
+    readonly requestId: string;
+    readonly answer: string;
+    /** Question ids to answer. Defaults to whatever the thread currently asks. */
+    readonly questionIds?: ReadonlyArray<string>;
+  }): Promise<number> {
+    const [origin, token] = await Promise.all([this.origin(), this.token()]);
+    let ids = input.questionIds ?? [];
+    if (ids.length === 0) {
+      const thread = await this.readThread(origin, token, input.threadId);
+      const pending = pendingUserInput(thread.activities, thread.latestTurn?.turnId ?? "");
+      if (pending === undefined || pending.requestId !== input.requestId) {
+        throw new MegazordDispatchError(
+          `refused: thread '${input.threadId}' has no open question '${input.requestId}'`,
+          { refusal: true },
+        );
+      }
+      ids = pending.questions.map((q) => q.id);
+    }
+    const answers: Record<string, string> = {};
+    for (const id of ids) answers[id] = input.answer;
+    return this.postDispatch(origin, token, {
+      type: "thread.user-input.respond",
+      commandId: this.uuid(),
+      threadId: input.threadId,
+      requestId: input.requestId,
+      answers,
+      createdAt: this.now(),
+    });
   }
 
   /** GET the orchestration snapshot and return its active projects. */

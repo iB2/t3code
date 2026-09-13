@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   DEFAULT_MODEL_BY_DRIVER,
+  pendingUserInput,
   defaultSsbMatcher,
   MegazordDispatchError,
   MegazordT3DispatchClient,
@@ -483,5 +484,162 @@ describe("continuing a thread", () => {
     expect(out.text).toBe("resposta");
     expect(out.timedOut).toBe(false);
     expect(out.url).toBe("http://127.0.0.1:3773/env-1/th-existing");
+  });
+});
+
+describe("a turn blocked on a question", () => {
+  const ASK = {
+    kind: "user-input.requested",
+    turnId: "turn-1",
+    payload: {
+      requestId: "req-1",
+      questions: [
+        {
+          id: "q1",
+          header: "Retomada",
+          question: "Seguimos?",
+          options: [{ label: "Sim" }, { label: "Nao" }],
+          multiSelect: false,
+        },
+      ],
+    },
+  };
+
+  it("is found from the activity log, with the id needed to answer it", () => {
+    const pending = pendingUserInput([{ kind: "tool.completed", turnId: "turn-1" }, ASK], "turn-1");
+    expect(pending?.requestId).toBe("req-1");
+    expect(pending?.questions[0]?.question).toBe("Seguimos?");
+    expect(pending?.questions[0]?.options).toEqual(["Sim", "Nao"]);
+  });
+
+  it("is closed once a later user-input activity lands", () => {
+    const answered = [ASK, { kind: "user-input.responded", turnId: "turn-1", payload: {} }];
+    expect(pendingUserInput(answered, "turn-1")).toBeUndefined();
+  });
+
+  it("belongs to its own turn", () => {
+    expect(pendingUserInput([ASK], "turn-2")).toBeUndefined();
+  });
+
+  it("stops the wait immediately instead of burning the timeout", async () => {
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/api/orchestration/threads/")) {
+        return new Response(
+          JSON.stringify({
+            thread: {
+              id: "th-1",
+              deletedAt: null,
+              archivedAt: null,
+              latestTurn: {
+                turnId: "turn-1",
+                state: "running",
+                requestedAt: "2026-09-13T00:00:00.000Z",
+              },
+              messages: [
+                {
+                  role: "assistant",
+                  text: "preciso de uma decisao",
+                  turnId: "turn-1",
+                  streaming: false,
+                },
+              ],
+              activities: [ASK],
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const client = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      fetchImpl,
+    });
+    const out = await client.awaitTurn({ threadId: "th-1", timeoutMs: 60_000, pollMs: 10 });
+    expect(out.state).toBe("awaiting-input");
+    expect(out.timedOut).toBe(false);
+    expect(out.pendingInput?.requestId).toBe("req-1");
+    expect(out.text).toBe("preciso de uma decisao");
+  });
+
+  it("answers every question of the request with the human's reply", async () => {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      calls.push({ url: u, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (u.includes("/api/orchestration/threads/")) {
+        return new Response(
+          JSON.stringify({
+            thread: {
+              id: "th-1",
+              deletedAt: null,
+              archivedAt: null,
+              latestTurn: {
+                turnId: "turn-1",
+                state: "running",
+                requestedAt: "2026-09-13T00:00:00.000Z",
+              },
+              messages: [],
+              activities: [ASK],
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ sequence: 7 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    const client = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      fetchImpl,
+    });
+    const seq = await client.respondUserInput({
+      threadId: "th-1",
+      requestId: "req-1",
+      answer: "segue o baile",
+    });
+    expect(seq).toBe(7);
+    const posted = calls.find((c) => c.url.endsWith("/dispatch"))!.body as {
+      type: string;
+      requestId: string;
+      answers: Record<string, string>;
+    };
+    expect(posted.type).toBe("thread.user-input.respond");
+    expect(posted.requestId).toBe("req-1");
+    expect(posted.answers).toEqual({ q1: "segue o baile" });
+  });
+
+  it("refuses to answer a question the thread is not asking", async () => {
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/api/orchestration/threads/")) {
+        return new Response(
+          JSON.stringify({
+            thread: { id: "th-1", deletedAt: null, archivedAt: null, messages: [], activities: [] },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ sequence: 1 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const client = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      fetchImpl,
+    });
+    await expect(
+      client.respondUserInput({ threadId: "th-1", requestId: "req-1", answer: "x" }),
+    ).rejects.toThrow(/no open question/);
   });
 });
