@@ -485,6 +485,55 @@ describe("continuing a thread", () => {
     expect(out.timedOut).toBe(false);
     expect(out.url).toBe("http://127.0.0.1:3773/env-1/th-existing");
   });
+
+  it("sendTurnAndAwait appends one turn to the existing thread and returns its answer", async () => {
+    const { fetchImpl, calls } = makeFetchStub();
+    let seq = 0;
+    const c = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      fetchImpl,
+      uuid: () => `uuid-${++seq}`,
+      now: () => "2026-09-13T00:00:00.000Z",
+    });
+    const out = await c.sendTurnAndAwait({
+      threadId: "th-existing",
+      task: "Qual numero eu pedi pra guardar?",
+      scope: "general",
+      driver: "claudeAgent",
+      timeoutMs: 5000,
+    });
+    // The round-trip continues the thread (turn.start only — never thread.create)…
+    const dispatches = calls.filter((cc) => cc.url.endsWith("/dispatch"));
+    expect(dispatches.map((cc) => (cc.body as { type: string }).type)).toEqual([
+      "thread.turn.start",
+    ]);
+    expect((dispatches[0]!.body as { threadId: string }).threadId).toBe("th-existing");
+    // …and reads the assistant reply back, tagged with the account that ran it.
+    expect(out.state).toBe("completed");
+    expect(out.text).toBe("resposta");
+    expect(out.driver).toBe("claudeAgent");
+    expect(out.instanceId).toBe("claudeAgent_claude_capiva");
+    expect(out.sequence).toBe(4242);
+    expect(out.url).toBe("http://127.0.0.1:3773/env-1/th-existing");
+  });
+
+  it("sendTurnAndAwait refuses a missing threadId before any I/O", async () => {
+    const { fetchImpl, calls } = makeFetchStub();
+    const c = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      fetchImpl,
+    });
+    await expect(
+      c.sendTurnAndAwait({ threadId: "  ", task: "x", scope: "general" }),
+    ).rejects.toBeInstanceOf(MegazordDispatchError);
+    expect(calls.length).toBe(0);
+  });
 });
 
 describe("a turn blocked on a question", () => {

@@ -739,6 +739,20 @@ export interface TurnWaitOutcome {
   readonly pendingInput?: PendingUserInput;
 }
 
+/**
+ * The result of a full round-trip: append one turn to an existing thread AND read
+ * that turn's answer back. It is the {@link TurnWaitOutcome} plus which
+ * (instance, harness, model) the owner ran the turn on and the dispatch sequence
+ * of the `thread.turn.start` that opened it.
+ */
+export interface TurnRoundTripOutcome extends TurnWaitOutcome {
+  readonly instanceId: string;
+  readonly driver: ProviderDriver | string;
+  readonly model: string;
+  /** Dispatch sequence of the `thread.turn.start` that opened the round-trip. */
+  readonly sequence: number;
+}
+
 const TERMINAL_TURN_STATES: ReadonlyArray<string> = ["completed", "error", "interrupted"];
 const DEFAULT_WAIT_TIMEOUT_MS = 900_000;
 const DEFAULT_WAIT_POLL_MS = 2_000;
@@ -1147,6 +1161,83 @@ export class MegazordT3DispatchClient {
       }
       await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
+  }
+
+  /**
+   * Append one turn to an EXISTING thread and return that turn's answer — the
+   * atomic round-trip a thin CLIENT (the WhatsApp bridge, the T3 GUI, another
+   * machine) makes against the single OWNER-hosted session. Exactly one thread is
+   * the orchestrator's persistent conversation; every surface's turn appends to
+   * it, so memory carries across turns and the reply flows back to whoever asked.
+   *
+   * It composes {@link dispatch} (continue the thread — `thread.turn.start`, no
+   * `thread.create`) with {@link awaitTurn} (poll the snapshot for the assistant
+   * reply). The `since` instant is captured BEFORE the turn is sent, so the wait
+   * can never latch onto the PREVIOUS turn's answer — the race that would make a
+   * continuity proof lie.
+   *
+   * Refused (never dispatched) if the thread is gone/deleted: a remembered id that
+   * no longer accepts turns is an error, not a silent new thread. Pass the SAME
+   * `scope`/`driver` the thread was created under — routing still runs to resolve
+   * the model selection, and a mismatched scope would resolve a wrong account.
+   */
+  async sendTurnAndAwait(input: {
+    /** The existing owner-hosted thread every surface appends to. */
+    readonly threadId: string;
+    /** The user turn text to append. */
+    readonly task: string;
+    /** NDA/quota scope — the SAME the thread was created under. */
+    readonly scope: DispatchScope;
+    /** Require a specific harness (match the thread's). */
+    readonly driver?: ProviderDriver;
+    /** Pin the model for this turn (validated against the harness's manifest). */
+    readonly model?: string;
+    /** Runtime mode override for this turn. */
+    readonly runtimeMode?: RuntimeMode;
+    /** Interaction mode. `plan` keeps the agent in planning (no edits). */
+    readonly interactionMode?: InteractionMode;
+    /** Wait ceiling. Default {@link DEFAULT_WAIT_TIMEOUT_MS}. */
+    readonly timeoutMs?: number;
+    /** Poll interval. Default {@link DEFAULT_WAIT_POLL_MS}. */
+    readonly pollMs?: number;
+  }): Promise<TurnRoundTripOutcome> {
+    const threadId = input.threadId.trim();
+    if (threadId === "") {
+      throw new MegazordDispatchError(
+        "refused: sendTurnAndAwait needs an existing threadId to append the turn to",
+        { refusal: true },
+      );
+    }
+    if (input.task.trim() === "") {
+      throw new MegazordDispatchError("refused: task text is required for a round-trip turn", {
+        refusal: true,
+      });
+    }
+    // Captured BEFORE the turn is sent: awaitTurn ignores any turn requested
+    // before this instant, so it cannot return the prior turn's answer.
+    const since = this.now();
+    const out = await this.dispatch({
+      task: input.task,
+      scope: input.scope,
+      threadId,
+      ...(input.driver !== undefined ? { driver: input.driver } : {}),
+      ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.runtimeMode !== undefined ? { runtimeMode: input.runtimeMode } : {}),
+      ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
+    });
+    const wait = await this.awaitTurn({
+      threadId,
+      since,
+      ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+      ...(input.pollMs !== undefined ? { pollMs: input.pollMs } : {}),
+    });
+    return {
+      ...wait,
+      instanceId: out.instanceId,
+      driver: out.driver,
+      model: out.model,
+      sequence: out.sequence ?? -1,
+    };
   }
 
   /** GET one thread's snapshot (the same read the UI does). */
