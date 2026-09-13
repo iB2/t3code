@@ -221,6 +221,7 @@ describe("MegazordT3DispatchClient", () => {
     const client = new MegazordT3DispatchClient({
       origin: "http://127.0.0.1:3773",
       token: "TESTTOKEN",
+      environmentId: "env-1",
       accounts: ACCOUNTS,
       fetchImpl,
     });
@@ -237,6 +238,7 @@ describe("MegazordT3DispatchClient", () => {
     const client = new MegazordT3DispatchClient({
       origin: "http://127.0.0.1:3773",
       token: "TESTTOKEN",
+      environmentId: "env-1",
       accounts: ACCOUNTS,
       fetchImpl,
       uuid: () => `uuid-${++seq}`,
@@ -261,7 +263,9 @@ describe("MegazordT3DispatchClient", () => {
     const create = dispatches[0]!.body as { modelSelection: { instanceId: string } };
     expect(create.modelSelection.instanceId).toBe("codex_codex_capiva");
     expect(out.sequence).toBe(4242);
-    expect(out.url).toContain("/api/orchestration/threads/");
+    // The link is the T3 UI route, openable by a human — not the API endpoint.
+    expect(out.url).toBe("http://127.0.0.1:3773/env-1/uuid-1");
+    expect(out.url).not.toContain("/api/");
   });
 
   it("create mode stops after thread.create (no harness, no quota spent)", async () => {
@@ -269,6 +273,7 @@ describe("MegazordT3DispatchClient", () => {
     const client = new MegazordT3DispatchClient({
       origin: "http://127.0.0.1:3773",
       token: "TESTTOKEN",
+      environmentId: "env-1",
       accounts: ACCOUNTS,
       fetchImpl,
     });
@@ -289,6 +294,7 @@ describe("MegazordT3DispatchClient", () => {
     const client = new MegazordT3DispatchClient({
       origin: "http://127.0.0.1:3773",
       token: "TESTTOKEN",
+      environmentId: "env-1",
       accounts: ACCOUNTS,
       fetchImpl,
     });
@@ -309,6 +315,7 @@ describe("MegazordT3DispatchClient", () => {
     const client = new MegazordT3DispatchClient({
       origin: "http://127.0.0.1:3773",
       token: "TESTTOKEN",
+      environmentId: "env-1",
       accounts: ACCOUNTS.filter((a) => a.instanceId !== "claudeAgent"),
       fetchImpl,
     });

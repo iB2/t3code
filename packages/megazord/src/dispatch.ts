@@ -365,6 +365,11 @@ export function settingsPath(baseDir: string): string {
   return nodePath.join(baseDir, "userdata", "settings.json");
 }
 
+/** Path to the server-written environment id under a base dir. */
+export function environmentIdPath(baseDir: string): string {
+  return nodePath.join(baseDir, "userdata", "environment-id");
+}
+
 /**
  * Read the running server's `origin` from `server-runtime.json`. This is how the
  * orchestrator finds the desktop's loopback HTTP server without any config.
@@ -396,6 +401,30 @@ export async function resolveOrigin(baseDir: string = defaultBaseDir()): Promise
     });
   }
   return origin.replace(/\/+$/, "");
+}
+
+/**
+ * Read this machine's environment id, written by the server into the same state
+ * dir as `server-runtime.json`. A thread link is `<origin>/<environmentId>/<threadId>`
+ * — the id is half the address, so a link built without it is not openable.
+ */
+export async function resolveEnvironmentId(baseDir: string = defaultBaseDir()): Promise<string> {
+  const file = environmentIdPath(baseDir);
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (cause) {
+    throw new MegazordDispatchError(
+      `cannot read T3 environment id at ${file} — is the desktop running? ` +
+        `(${String((cause as Error)?.message ?? cause)})`,
+      { refusal: true },
+    );
+  }
+  const id = text.trim();
+  if (id === "") {
+    throw new MegazordDispatchError(`environment id file is empty: ${file}`, { refusal: true });
+  }
+  return id;
 }
 
 /**
@@ -472,6 +501,8 @@ export interface MegazordT3DispatchClientOptions {
   readonly origin?: string;
   /** Skip minting: use this bearer token (scope `orchestration:operate`). */
   readonly token?: string;
+  /** Skip discovery: use this environment id instead of reading `environment-id`. */
+  readonly environmentId?: string;
   /** Override the token-mint command. Defaults to `node <server>/bin.ts auth session issue`. */
   readonly mintTokenCommand?: MintTokenCommand;
   /** Node executable used to mint. Defaults to `process.execPath`. */
@@ -560,6 +591,7 @@ export class MegazordT3DispatchClient {
   private readonly baseDir: string;
   private readonly originOverride: string | undefined;
   private readonly tokenOverride: string | undefined;
+  private readonly environmentIdOverride: string | undefined;
   private readonly mintTokenCommand: MintTokenCommand | undefined;
   private readonly nodeBin: string;
   private readonly serverBinPath: string;
@@ -577,11 +609,13 @@ export class MegazordT3DispatchClient {
 
   private cachedOrigin: string | undefined;
   private cachedToken: string | undefined;
+  private cachedEnvironmentId: string | undefined;
 
   constructor(options: MegazordT3DispatchClientOptions = {}) {
     this.baseDir = options.baseDir ?? defaultBaseDir();
     this.originOverride = options.origin;
     this.tokenOverride = options.token;
+    this.environmentIdOverride = options.environmentId;
     this.mintTokenCommand = options.mintTokenCommand;
     this.nodeBin = options.nodeBin ?? process.execPath;
     this.serverBinPath = options.serverBinPath ?? defaultServerBinPath();
@@ -604,6 +638,14 @@ export class MegazordT3DispatchClient {
     if (this.cachedOrigin !== undefined) return this.cachedOrigin;
     this.cachedOrigin = await resolveOrigin(this.baseDir);
     return this.cachedOrigin;
+  }
+
+  /** Resolve this machine's environment id (cached). */
+  async environmentId(): Promise<string> {
+    if (this.environmentIdOverride !== undefined) return this.environmentIdOverride;
+    if (this.cachedEnvironmentId !== undefined) return this.cachedEnvironmentId;
+    this.cachedEnvironmentId = await resolveEnvironmentId(this.baseDir);
+    return this.cachedEnvironmentId;
   }
 
   /** Mint (or reuse) a bearer token with `orchestration:operate` scope (cached). */
@@ -676,7 +718,13 @@ export class MegazordT3DispatchClient {
       };
     }
 
-    const [origin, token] = await Promise.all([this.origin(), this.token()]);
+    // The environment id is resolved UP FRONT (not after create) so a machine that
+    // cannot produce an openable link fails before a thread exists, not after.
+    const [origin, token, environmentId] = await Promise.all([
+      this.origin(),
+      this.token(),
+      this.environmentId(),
+    ]);
     const projectId = await this.resolveProjectId(origin, token, request);
     const threadId = this.uuid();
     const title = (request.title ?? request.task).trim().slice(0, 80) || "orchestrated thread";
@@ -697,7 +745,10 @@ export class MegazordT3DispatchClient {
       createdAt: this.now(),
     });
 
-    const url = `${origin}/api/orchestration/threads/${threadId}`;
+    // The UI route (`/$environmentId/$threadId`), NOT the API endpoint: this url is
+    // relayed to humans (WhatsApp), and /api/orchestration/threads/<id> answers 401
+    // JSON in a browser instead of opening the thread.
+    const url = `${origin}/${environmentId}/${threadId}`;
     if (mode === "create") {
       return {
         threadId,
