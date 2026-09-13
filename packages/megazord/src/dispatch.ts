@@ -173,6 +173,10 @@ export interface SelectInstanceInput {
   readonly ssbMatcher?: SsbMatcher;
   /** Model overrides per harness. Defaults to {@link DEFAULT_MODEL_BY_DRIVER}. */
   readonly modelByDriver?: Readonly<Record<string, string>>;
+  /** Pin ONE model for this request, beating the instance/driver defaults. */
+  readonly model?: string;
+  /** Valid model ids per harness, for validating {@link model}. Unknown = no gate. */
+  readonly modelsByDriver?: Readonly<Record<string, ReadonlyArray<string>>>;
   /** Used-percent at/above which an instance is treated as saturated (sorted last). Default 95. */
   readonly saturationPercent?: number;
 }
@@ -198,7 +202,23 @@ function isEnabled(account: ProviderInstanceAccount): boolean {
 function resolveModel(
   account: ProviderInstanceAccount,
   modelByDriver: Readonly<Record<string, string>>,
+  requested?: string,
+  modelsByDriver?: Readonly<Record<string, ReadonlyArray<string>>>,
 ): string {
+  const pinned = (requested ?? "").trim();
+  if (pinned !== "") {
+    // Validate when the manifest is known: a bad id would otherwise produce a thread
+    // that fails on its first turn, far from the caller who typed it.
+    const valid = modelsByDriver?.[account.driver];
+    if (valid !== undefined && valid.length > 0 && !valid.includes(pinned)) {
+      throw new MegazordDispatchError(
+        `refused: model '${pinned}' is not available for harness '${account.driver}' ` +
+          `(valid: ${valid.join(", ")})`,
+        { refusal: true },
+      );
+    }
+    return pinned;
+  }
   const preferred = (account.preferredModel ?? "").trim();
   if (preferred !== "") return preferred;
   const byDriver = modelByDriver[account.driver];
@@ -208,6 +228,21 @@ function resolveModel(
       `pass a model override or set the instance's preferred model`,
     { refusal: true },
   );
+}
+
+/**
+ * Join the assistant text a given turn produced. Streaming placeholders are skipped:
+ * a half-written message relayed to a chat reads as a bug.
+ */
+export function assistantTextForTurn(
+  messages: ReadonlyArray<Record<string, unknown>>,
+  turnId: string,
+): string {
+  return messages
+    .filter((m) => m["role"] === "assistant" && m["turnId"] === turnId && m["streaming"] !== true)
+    .map((m) => String(m["text"] ?? "").trim())
+    .filter((text) => text !== "")
+    .join("\n\n");
 }
 
 /** Max window used-percent for an instance, or `undefined` when quota unknown. */
@@ -323,10 +358,11 @@ export function selectInstance(input: SelectInstanceInput): DispatchDecision {
 
   // ── Gate 3: quota (least-loaded, deterministic tie-break) ──────────────────
   const { account, load } = pickLeastLoaded(candidates, input.usage, saturationPercent);
-  const model = resolveModel(account, modelByDriver);
+  const model = resolveModel(account, modelByDriver, input.model, input.modelsByDriver);
 
   const reasonParts: string[] = [`scope=${input.scope}`];
   if (input.scope === "ssb") reasonParts.push("SSB-exclusive account");
+  if ((input.model ?? "").trim() !== "") reasonParts.push(`model pinned=${input.model}`);
   if (input.driver !== undefined) reasonParts.push(`driver=${input.driver}`);
   if (input.needs) reasonParts.push(`needs=${input.needs}`);
   reasonParts.push(
@@ -365,6 +401,11 @@ export function settingsPath(baseDir: string): string {
   return nodePath.join(baseDir, "userdata", "settings.json");
 }
 
+/** Path to the cached provider model manifest under a base dir. */
+export function modelManifestPath(baseDir: string): string {
+  return nodePath.join(baseDir, "userdata", "model-manifest.json");
+}
+
 /** Path to the server-written environment id under a base dir. */
 export function environmentIdPath(baseDir: string): string {
   return nodePath.join(baseDir, "userdata", "environment-id");
@@ -401,6 +442,32 @@ export async function resolveOrigin(baseDir: string = defaultBaseDir()): Promise
     });
   }
   return origin.replace(/\/+$/, "");
+}
+
+/**
+ * Read the valid model ids per harness from the desktop's cached manifest. This is
+ * purely an input to validation, so an unreadable manifest returns `{}` (no gate)
+ * rather than blocking a dispatch that would otherwise work.
+ */
+export async function readDriverModels(
+  baseDir: string = defaultBaseDir(),
+): Promise<Readonly<Record<string, ReadonlyArray<string>>>> {
+  try {
+    const parsed = JSON.parse(await readFile(modelManifestPath(baseDir), "utf8")) as {
+      manifest?: { currentModels?: unknown };
+    };
+    const current = parsed?.manifest?.currentModels;
+    if (current === null || typeof current !== "object") return {};
+    const out: Record<string, ReadonlyArray<string>> = {};
+    for (const [driver, ids] of Object.entries(current as Record<string, unknown>)) {
+      if (Array.isArray(ids)) {
+        out[driver] = ids.filter((id): id is string => typeof id === "string");
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -517,6 +584,8 @@ export interface MegazordT3DispatchClientOptions {
   readonly ssbMatcher?: SsbMatcher;
   /** Model overrides per harness. */
   readonly modelByDriver?: Readonly<Record<string, string>>;
+  /** Inject valid model ids per harness (skips reading the manifest). For tests. */
+  readonly modelsByDriver?: Readonly<Record<string, ReadonlyArray<string>>>;
   /** Inject the account inventory (skips reading settings.json). For tests. */
   readonly accounts?: ReadonlyArray<ProviderInstanceAccount>;
   /** Default runtime mode for spawned turns. Defaults to `approval-required` (safe). */
@@ -539,7 +608,7 @@ export interface DispatchOutcome {
   readonly instanceId: string;
   readonly driver: ProviderDriver | string;
   readonly model: string;
-  /** Read-only thread resource on the live server (there is no GUI deep-link scheme). */
+  /** Deep link to the thread in the T3 UI (`<origin>/<environmentId>/<threadId>`). */
   readonly url: string;
   /** What ran: `select` (no dispatch), `create` (thread only), or `full` (thread + first turn). */
   readonly mode: "select" | "create" | "full";
@@ -562,6 +631,8 @@ export interface DispatchRequest {
   readonly driver?: ProviderDriver;
   /** Require an exclusive connector. */
   readonly needs?: string;
+  /** Pin the model for this thread (validated against the harness's manifest). */
+  readonly model?: string;
   /** Thread title. Defaults to a truncated task. */
   readonly title?: string;
   /** Runtime mode override for this turn. */
@@ -579,6 +650,27 @@ export interface DispatchRequest {
    */
   readonly mode?: "select" | "create" | "full";
 }
+
+/** How a turn ended, from the caller's point of view. */
+export type TurnWaitState = "completed" | "error" | "interrupted" | "running";
+
+/** The result of waiting on a dispatched turn. */
+export interface TurnWaitOutcome {
+  readonly threadId: string;
+  readonly turnId: string;
+  /** `running` means the wait timed out with the turn still going (or blocked on an approval). */
+  readonly state: TurnWaitState;
+  /** Assistant text produced by that turn, joined. Empty when the turn produced none. */
+  readonly text: string;
+  /** Deep link to the thread in the T3 UI. */
+  readonly url: string;
+  /** True when the wait hit its own ceiling rather than a terminal state. */
+  readonly timedOut: boolean;
+}
+
+const TERMINAL_TURN_STATES: ReadonlyArray<string> = ["completed", "error", "interrupted"];
+const DEFAULT_WAIT_TIMEOUT_MS = 900_000;
+const DEFAULT_WAIT_POLL_MS = 2_000;
 
 const DEFAULT_MINT_TIMEOUT_MS = 60_000;
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -600,6 +692,9 @@ export class MegazordT3DispatchClient {
   private readonly ssbMatcher: SsbMatcher;
   private readonly modelByDriver: Readonly<Record<string, string>>;
   private readonly accountsOverride: ReadonlyArray<ProviderInstanceAccount> | undefined;
+  private readonly modelsByDriverOverride:
+    | Readonly<Record<string, ReadonlyArray<string>>>
+    | undefined;
   private readonly runtimeMode: RuntimeMode;
   private readonly mintTimeoutMs: number;
   private readonly timeoutMs: number;
@@ -624,6 +719,7 @@ export class MegazordT3DispatchClient {
     this.ssbMatcher = options.ssbMatcher ?? defaultSsbMatcher;
     this.modelByDriver = options.modelByDriver ?? DEFAULT_MODEL_BY_DRIVER;
     this.accountsOverride = options.accounts;
+    this.modelsByDriverOverride = options.modelsByDriver;
     this.runtimeMode = options.runtimeMode ?? "approval-required";
     this.mintTimeoutMs = options.mintTimeoutMs ?? DEFAULT_MINT_TIMEOUT_MS;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -662,6 +758,12 @@ export class MegazordT3DispatchClient {
     return readAccounts(this.baseDir);
   }
 
+  /** Valid model ids per harness (or the injected override). */
+  async driverModels(): Promise<Readonly<Record<string, ReadonlyArray<string>>>> {
+    if (this.modelsByDriverOverride !== undefined) return this.modelsByDriverOverride;
+    return readDriverModels(this.baseDir);
+  }
+
   /** Read best-effort quota (empty when no source configured). */
   async usage(): Promise<ReadonlyArray<InstanceUsage>> {
     if (this.usageSource === undefined) return [];
@@ -678,15 +780,21 @@ export class MegazordT3DispatchClient {
    * dispatch. This is the cheap "prove the selection" path — safe for SSB.
    */
   async select(
-    request: Pick<DispatchRequest, "scope" | "driver" | "needs">,
+    request: Pick<DispatchRequest, "scope" | "driver" | "needs" | "model">,
   ): Promise<DispatchDecision> {
-    const [accounts, usage] = await Promise.all([this.accounts(), this.usage()]);
+    const pinned = (request.model ?? "").trim();
+    const [accounts, usage, modelsByDriver] = await Promise.all([
+      this.accounts(),
+      this.usage(),
+      pinned === "" ? Promise.resolve({}) : this.driverModels(),
+    ]);
     return selectInstance({
       accounts,
       scope: request.scope,
       usage,
       ssbMatcher: this.ssbMatcher,
       modelByDriver: this.modelByDriver,
+      ...(pinned !== "" ? { model: pinned, modelsByDriver } : {}),
       ...(request.driver !== undefined ? { driver: request.driver } : {}),
       ...(request.needs !== undefined ? { needs: request.needs } : {}),
       ...(this.capabilities !== undefined ? { capabilities: this.capabilities } : {}),
@@ -814,6 +922,112 @@ export class MegazordT3DispatchClient {
       );
     }
     return match.id;
+  }
+
+  /**
+   * Poll a dispatched thread until its latest turn reaches a terminal state, then
+   * return that turn's assistant text.
+   *
+   * This is what turns a fire-and-forget dispatch into an answer a chat channel can
+   * relay. It polls rather than streams on purpose: the caller is a short-lived CLI
+   * invocation, and the thread snapshot endpoint is the same read the UI does.
+   *
+   * A turn blocked on an approval never reaches a terminal state, so the wait ends
+   * with `state: "running", timedOut: true` instead of hanging forever — the caller
+   * relays the link and the human takes over.
+   */
+  async awaitTurn(input: {
+    readonly threadId: string;
+    /** Ignore turns requested before this ISO instant (guards against a stale turn). */
+    readonly since?: string;
+    readonly timeoutMs?: number;
+    readonly pollMs?: number;
+  }): Promise<TurnWaitOutcome> {
+    const [origin, token, environmentId] = await Promise.all([
+      this.origin(),
+      this.token(),
+      this.environmentId(),
+    ]);
+    const url = `${origin}/${environmentId}/${input.threadId}`;
+    const timeoutMs = input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+    const pollMs = input.pollMs ?? DEFAULT_WAIT_POLL_MS;
+    const sinceMs = input.since === undefined ? undefined : Date.parse(input.since);
+    const deadline = Date.now() + timeoutMs;
+
+    let lastTurnId = "";
+    let lastState: TurnWaitState = "running";
+    for (;;) {
+      const thread = await this.readThread(origin, token, input.threadId);
+      const turn = thread.latestTurn;
+      const fresh =
+        turn !== undefined &&
+        (sinceMs === undefined ||
+          Number.isNaN(sinceMs) ||
+          Date.parse(turn.requestedAt) >= sinceMs - 1000);
+      if (turn !== undefined && fresh) {
+        lastTurnId = turn.turnId;
+        lastState = TERMINAL_TURN_STATES.includes(turn.state)
+          ? (turn.state as TurnWaitState)
+          : "running";
+        if (TERMINAL_TURN_STATES.includes(turn.state)) {
+          return {
+            threadId: input.threadId,
+            turnId: turn.turnId,
+            state: lastState,
+            text: assistantTextForTurn(thread.messages, turn.turnId),
+            url,
+            timedOut: false,
+          };
+        }
+      }
+      if (Date.now() >= deadline) {
+        return {
+          threadId: input.threadId,
+          turnId: lastTurnId,
+          state: lastState,
+          text: lastTurnId === "" ? "" : assistantTextForTurn(thread.messages, lastTurnId),
+          url,
+          timedOut: true,
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+  }
+
+  /** GET one thread's snapshot (the same read the UI does). */
+  private async readThread(
+    origin: string,
+    token: string,
+    threadId: string,
+  ): Promise<{
+    readonly latestTurn?: { turnId: string; state: string; requestedAt: string };
+    readonly messages: ReadonlyArray<Record<string, unknown>>;
+  }> {
+    const res = await this.httpGet(
+      `${origin}/api/orchestration/threads/${encodeURIComponent(threadId)}`,
+      token,
+    );
+    const body = (await safeJson(res)) as { thread?: Record<string, unknown> };
+    const thread = body?.thread;
+    if (thread === null || typeof thread !== "object") {
+      throw new MegazordDispatchError(`thread ${threadId} not found on the live server`, {
+        refusal: true,
+      });
+    }
+    const rawTurn = thread["latestTurn"];
+    const messages = Array.isArray(thread["messages"])
+      ? (thread["messages"] as ReadonlyArray<Record<string, unknown>>)
+      : [];
+    if (rawTurn === null || typeof rawTurn !== "object") return { messages };
+    const t = rawTurn as Record<string, unknown>;
+    return {
+      latestTurn: {
+        turnId: String(t["turnId"] ?? ""),
+        state: String(t["state"] ?? ""),
+        requestedAt: String(t["requestedAt"] ?? ""),
+      },
+      messages,
+    };
   }
 
   /** GET the orchestration snapshot and return its active projects. */

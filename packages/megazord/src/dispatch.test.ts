@@ -325,3 +325,63 @@ describe("MegazordT3DispatchClient", () => {
     expect(calls.length).toBe(0);
   });
 });
+
+describe("model pinning", () => {
+  it("a pinned model beats the harness default and says so in the reason", () => {
+    const decision = selectInstance({
+      accounts: ACCOUNTS,
+      scope: "general",
+      driver: "claudeAgent",
+      model: "claude-opus-5",
+      modelsByDriver: { claudeAgent: ["claude-opus-5", "claude-sonnet-5"] },
+    });
+    expect(decision.model).toBe("claude-opus-5");
+    expect(decision.reason).toContain("model pinned=claude-opus-5");
+  });
+
+  it("refuses a model the harness does not offer instead of creating a dead thread", () => {
+    expect(() =>
+      selectInstance({
+        accounts: ACCOUNTS,
+        scope: "general",
+        driver: "claudeAgent",
+        model: "gpt-5.6-sol",
+        modelsByDriver: { claudeAgent: ["claude-opus-5", "claude-sonnet-5"] },
+      }),
+    ).toThrow(/not available for harness 'claudeAgent'/);
+  });
+
+  it("an unknown manifest does not gate the pin", () => {
+    const decision = selectInstance({
+      accounts: ACCOUNTS,
+      scope: "general",
+      driver: "claudeAgent",
+      model: "claude-opus-5",
+    });
+    expect(decision.model).toBe("claude-opus-5");
+  });
+
+  it("dispatch sends the pinned model in thread.create", async () => {
+    const { fetchImpl, calls } = makeFetchStub();
+    const client = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      modelsByDriver: { claudeAgent: ["claude-opus-5"] },
+      fetchImpl,
+    });
+    const out = await client.dispatch({
+      task: "do a thing",
+      scope: "general",
+      projectId: "proj-1",
+      driver: "claudeAgent",
+      model: "claude-opus-5",
+    });
+    expect(out.model).toBe("claude-opus-5");
+    const create = calls.filter((c) => c.url.endsWith("/dispatch"))[0]!.body as {
+      modelSelection: { model: string };
+    };
+    expect(create.modelSelection.model).toBe("claude-opus-5");
+  });
+});

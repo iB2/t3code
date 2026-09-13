@@ -9,7 +9,7 @@
  *
  * Usage:
  *   node bin/t3-dispatch.mjs --task "<prompt>" --scope ssb|general \
- *        [--driver codex|claudeAgent] [--needs <connector>] \
+ *        [--driver codex|claudeAgent] [--model <id>] [--needs <connector>] \
  *        [--project <projectId>] [--project-title "<title>"] \
  *        [--mode select|create|full] [--runtime approval-required|auto|...] \
  *        [--base-dir <dir>] [--json]
@@ -35,6 +35,9 @@ function parseArgs(argv) {
         break;
       case "--driver":
         out.driver = next();
+        break;
+      case "--model":
+        out.model = next();
         break;
       case "--needs":
         out.needs = next();
@@ -82,6 +85,7 @@ const HELP = `t3-dispatch — dispatch orchestrator work as a routed T3 thread
   --task "<prompt>"            the first-turn prompt (required for create/full)
   --scope ssb|general          NDA/quota scope (default: general)
   --driver codex|claudeAgent   require a specific harness
+  --model <id>                 pin the thread's model (validated per harness)
   --needs <connector>          require an exclusive connector/MCP
   --project <projectId>        target project id
   --project-title "<title>"    resolve project id by exact title
@@ -118,6 +122,7 @@ async function main() {
       scope: args.scope,
       mode: args.mode,
       ...(args.driver ? { driver: args.driver } : {}),
+      ...(args.model ? { model: args.model } : {}),
       ...(args.needs ? { needs: args.needs } : {}),
       ...(args.projectId ? { projectId: args.projectId } : {}),
       ...(args.projectTitle ? { projectTitle: args.projectTitle } : {}),
