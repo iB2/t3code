@@ -275,6 +275,147 @@ const TOOLS = {
       return { routineId: a.routineId, set: a.enabled, triggers: results };
     },
   },
+
+  paperclip_health: {
+    description:
+      "Resilience sweep of the Paperclip control-plane: are the backends reachable, " +
+      "are enabled routines running on time (or did a run fail/never execute), and " +
+      "are any threads (tasks) stuck running. Returns findings ranked by severity. " +
+      "Read-only — the supervisor loop uses this to alert + decide healing actions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        stuck_minutes: {
+          type: "number",
+          description: "Flag threads running longer than this (default 30).",
+        },
+        stale_hours: {
+          type: "number",
+          description: "Flag enabled routines with no completed run within this (default 26).",
+        },
+      },
+    },
+    handler: async (a) => {
+      const stuckMs = (a.stuck_minutes ?? 30) * 60_000;
+      const staleMs = (a.stale_hours ?? 26) * 3_600_000;
+      const now = Date.now();
+      const findings = [];
+      const timed = async (fn) => {
+        const t0 = Date.now();
+        try {
+          const v = await fn();
+          return { ok: true, ms: Date.now() - t0, value: v };
+        } catch (e) {
+          return { ok: false, ms: Date.now() - t0, error: String(e?.message ?? e).slice(0, 200) };
+        }
+      };
+
+      // 1. Backends reachable?
+      const orch = await timed(() => orchGet("/api/orchestration/snapshot"));
+      const rout = await timed(() => routinesApi("GET", `/companies/${COMPANY_ID}/routines`));
+      if (!orch.ok)
+        findings.push({
+          severity: "critical",
+          area: "backend",
+          message: `orchestration (:3773) unreachable: ${orch.error}`,
+        });
+      if (!rout.ok)
+        findings.push({
+          severity: "critical",
+          area: "backend",
+          message: `routines (:3100) unreachable: ${rout.error}`,
+        });
+
+      // 2. Routines: enabled ones running on time?
+      let routinesReport = { total: 0, scheduleEnabled: 0, checked: 0 };
+      if (rout.ok) {
+        const rs = asRoutineList(rout.value);
+        const enabled = rs.filter((r) =>
+          (r.triggers ?? []).some((t) => t.kind === "schedule" && t.enabled),
+        );
+        routinesReport = { total: rs.length, scheduleEnabled: enabled.length, checked: 0 };
+        for (const r of enabled) {
+          const runs = await timed(() => routinesApi("GET", `/routines/${r.id}/runs?limit=5`));
+          if (!runs.ok) continue;
+          routinesReport.checked++;
+          const list = Array.isArray(runs.value)
+            ? runs.value
+            : (runs.value.runs ?? runs.value.data ?? []);
+          const last = list[0];
+          if (!last) {
+            findings.push({
+              severity: "warn",
+              area: "routine",
+              message: `${r.title}: enabled but no run recorded yet`,
+            });
+            continue;
+          }
+          const started = Date.parse(last.completedAt ?? last.createdAt ?? last.triggeredAt ?? "");
+          if (last.status === "failed" || last.failureReason)
+            findings.push({
+              severity: "warn",
+              area: "routine",
+              message: `${r.title}: last run failed (${last.failureReason ?? last.status})`,
+              runId: last.id,
+            });
+          else if (Number.isFinite(started) && now - started > staleMs)
+            findings.push({
+              severity: "warn",
+              area: "routine",
+              message: `${r.title}: no completed run in ${Math.round((now - started) / 3_600_000)}h (schedule may be missing)`,
+            });
+        }
+      }
+
+      // 3. Stuck threads (from the snapshot)
+      let threadsReport = { total: 0, byState: {}, stuck: 0 };
+      if (orch.ok) {
+        const snap = orch.value;
+        const threads = [];
+        const walk = (o) => {
+          if (Array.isArray(o)) return o.forEach(walk);
+          if (o && typeof o === "object") {
+            if (typeof o.threadId === "string" || (o.id && o.title && o.state)) threads.push(o);
+            Object.values(o).forEach(walk);
+          }
+        };
+        walk(snap);
+        const byState = {};
+        for (const t of threads) {
+          const st = t.state ?? t.status ?? "unknown";
+          byState[st] = (byState[st] ?? 0) + 1;
+          const ts = Date.parse(t.latestActivityAt ?? t.updatedAt ?? t.createdAt ?? "");
+          if (["running", "starting"].includes(st) && Number.isFinite(ts) && now - ts > stuckMs) {
+            findings.push({
+              severity: "warn",
+              area: "thread",
+              message: `thread ${String(t.threadId ?? t.id).slice(0, 8)} stuck in '${st}' for ${Math.round((now - ts) / 60_000)}min`,
+              threadId: t.threadId ?? t.id,
+            });
+            threadsReport.stuck++;
+          }
+        }
+        threadsReport.total = threads.length;
+        threadsReport.byState = byState;
+      }
+
+      findings.sort(
+        (x, y) => (x.severity === "critical" ? -1 : 1) - (y.severity === "critical" ? -1 : 1),
+      );
+      return {
+        checkedAt: new Date().toISOString(),
+        healthy: findings.filter((f) => f.severity === "critical").length === 0,
+        backends: {
+          orchestration: { ok: orch.ok, ms: orch.ms },
+          routines: { ok: rout.ok, ms: rout.ms },
+        },
+        routines: routinesReport,
+        threads: threadsReport,
+        findings,
+        note: "MCP client connection state (e.g. qmd/mcp-lumon) is not visible from inside this server; it probes the control-plane backends directly. The scheduling supervisor pairs this with an alert channel.",
+      };
+    },
+  },
 };
 
 // ── JSON-RPC / MCP plumbing ──────────────────────────────────────────────────
