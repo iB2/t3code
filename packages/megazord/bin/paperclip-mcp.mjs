@@ -1,0 +1,493 @@
+#!/usr/bin/env node
+/**
+ * paperclip-mcp — an MCP (stdio) server that lets an agent OPERATE the local
+ * Paperclip/T3 orchestration plane as tools: run work (spawn an agent as a
+ * routed thread), read the live snapshot, check/continue/answer threads, and
+ * inspect accounts+quota. Wraps the proven `MegazordT3DispatchClient` (same
+ * origin-resolve + scoped-token-mint + HTTP path that `t3-dispatch` uses).
+ *
+ * Transport: newline-delimited JSON-RPC 2.0 on stdio (MCP stdio transport).
+ * The token is minted at runtime and NEVER written to disk.
+ *
+ * This is Track A of the Paperclip control-plane (see
+ * capiva-factory/PAPERCLIP-CONTROL-PLANE-SPEC.md). Routines/scheduling land
+ * NATIVELY on top of this (Track B, Bruno's decision 2026-09-14).
+ *
+ * @module megazord/bin/paperclip-mcp
+ */
+import { MegazordDispatchError, MegazordT3DispatchClient } from "../src/dispatch.ts";
+
+const SERVER_INFO = { name: "paperclip", version: "0.1.0" };
+const PROTOCOL_VERSION = "2024-11-05";
+
+const client = new MegazordT3DispatchClient({});
+
+// ── HTTP helper for read endpoints the client does not wrap yet ──────────────
+async function orchGet(path) {
+  const origin = await client.origin();
+  const token = await client.token();
+  const res = await fetch(`${origin}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`GET ${path} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+// ── Routines/org live on the isolated company instance (Paperclip acp-engine),
+//    a LOCAL unauthenticated HTTP API (default :3100). The 31 native routines
+//    were created by capiva-factory/scripts/native-routines-setup.mjs, all with
+//    their schedule trigger DISABLED (Bruno's credit-safety mandate). Enabling a
+//    routine is Bruno's explicit decision — never auto-enable. ─────────────────
+const ROUTINES_BASE = process.env.PAPERCLIP_ROUTINES_BASE ?? "http://127.0.0.1:3100/api";
+const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID ?? "47ef245e-ff23-41be-a39d-21e4ac66ed2a";
+
+async function routinesApi(method, path, body) {
+  const res = await fetch(`${ROUTINES_BASE}${path}`, {
+    method,
+    headers: body ? { "content-type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = text;
+  }
+  if (!res.ok) throw new Error(`${method} ${path} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
+  return json;
+}
+
+function asRoutineList(d) {
+  return Array.isArray(d) ? d : (d.routines ?? d.data ?? []);
+}
+
+// ── Tools: name -> { description, inputSchema, handler(args) -> object } ──────
+const TOOLS = {
+  paperclip_run: {
+    description:
+      "Run work on Paperclip: spawn an agent as a routed T3 thread (a task) and " +
+      "start its first turn. Returns the thread id + cockpit link. Use for ad-hoc " +
+      "runs and for kicking off any project work.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: { type: "string", description: "The first-turn prompt / instruction." },
+        scope: {
+          type: "string",
+          enum: ["general", "ssb"],
+          description: "NDA/quota scope (default general).",
+        },
+        driver: {
+          type: "string",
+          enum: ["codex", "claudeAgent"],
+          description: "Force a harness (optional).",
+        },
+        model: { type: "string", description: "Pin the thread model (optional)." },
+        project_title: { type: "string", description: "Target project by exact title (optional)." },
+        title: { type: "string", description: "Thread title shown in the cockpit (optional)." },
+        runtime: { type: "string", description: "Runtime mode (default full-access)." },
+      },
+      required: ["task"],
+    },
+    handler: async (a) => {
+      const out = await client.dispatch({
+        task: a.task,
+        scope: a.scope ?? "general",
+        mode: "full",
+        runtimeMode: a.runtime ?? "full-access",
+        ...(a.driver ? { driver: a.driver } : {}),
+        ...(a.model ? { model: a.model } : {}),
+        ...(a.project_title ? { projectTitle: a.project_title } : {}),
+        ...(a.title ? { title: a.title } : {}),
+      });
+      return {
+        threadId: out.threadId,
+        url: out.url,
+        instance: out.instanceId,
+        driver: out.driver,
+        model: out.model,
+        why: out.decision?.reason,
+      };
+    },
+  },
+
+  paperclip_snapshot: {
+    description:
+      "Read the live orchestration snapshot: every project and thread (task) with " +
+      "its state. The foundation for monitoring / resilience (stuck or never-run work).",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => await orchGet("/api/orchestration/snapshot"),
+  },
+
+  paperclip_thread_status: {
+    description: "Check whether a thread (task) is still open/alive.",
+    inputSchema: {
+      type: "object",
+      properties: { threadId: { type: "string" } },
+      required: ["threadId"],
+    },
+    handler: async (a) => {
+      const origin = await client.origin();
+      const token = await client.token();
+      const open = await client.threadIsOpen(origin, token, a.threadId);
+      return { threadId: a.threadId, open };
+    },
+  },
+
+  paperclip_thread_continue: {
+    description:
+      "Send a follow-up turn to an EXISTING thread and wait for the reply " +
+      "(continue a conversation instead of spawning a new task).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        threadId: { type: "string" },
+        message: { type: "string" },
+        timeout_seconds: { type: "number", description: "Max wait (default 900)." },
+      },
+      required: ["threadId", "message"],
+    },
+    handler: async (a) => {
+      const out = await client.sendTurnAndAwait({
+        threadId: a.threadId,
+        task: a.message,
+        ...(a.timeout_seconds ? { timeoutMs: a.timeout_seconds * 1000 } : {}),
+      });
+      return out;
+    },
+  },
+
+  paperclip_accounts: {
+    description:
+      "Inspect the org side you can see locally: provider instances (the agents/" +
+      "accounts) and their quota/usage. Read-only.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => ({
+      accounts: await client.accounts(),
+      usage: await client.usage().catch((e) => `usage unavailable: ${String(e).slice(0, 120)}`),
+    }),
+  },
+
+  paperclip_routine_list: {
+    description:
+      "List the native Paperclip routines (recurring work) of the company, with " +
+      "each one's status and whether its schedule trigger is enabled (i.e. will " +
+      "auto-fire). Read-only. Foundation for the resilience monitor.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      const rs = asRoutineList(await routinesApi("GET", `/companies/${COMPANY_ID}/routines`));
+      return {
+        total: rs.length,
+        routines: rs.map((r) => {
+          const sched = (r.triggers ?? []).filter((t) => t.kind === "schedule");
+          return {
+            id: r.id,
+            title: r.title,
+            status: r.status,
+            scheduleEnabled: sched.some((t) => t.enabled),
+            cron: sched.map((t) => t.cronExpression).join(", ") || null,
+          };
+        }),
+      };
+    },
+  },
+
+  paperclip_routine_get: {
+    description: "Get one routine in full (triggers, variables, assignee, policies).",
+    inputSchema: {
+      type: "object",
+      properties: { routineId: { type: "string" } },
+      required: ["routineId"],
+    },
+    handler: async (a) => await routinesApi("GET", `/routines/${a.routineId}`),
+  },
+
+  paperclip_routine_runs: {
+    description:
+      "List the recent runs of a routine (executed/failed/missed). Read-only. The " +
+      "core signal for resilience: detect runs that did not execute or errored.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        routineId: { type: "string" },
+        limit: { type: "number", description: "Max runs (optional)." },
+      },
+      required: ["routineId"],
+    },
+    handler: async (a) =>
+      await routinesApi(
+        "GET",
+        `/routines/${a.routineId}/runs${a.limit ? `?limit=${a.limit}` : ""}`,
+      ),
+  },
+
+  paperclip_routine_run: {
+    description:
+      "Run a routine NOW, ad-hoc (source=manual). Works even when the schedule " +
+      "trigger is disabled — it does NOT enable auto-firing, it is a single manual " +
+      "run. Costs credit for that run.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        routineId: { type: "string" },
+        payload: { type: "object", description: "Optional run payload." },
+      },
+      required: ["routineId"],
+    },
+    handler: async (a) =>
+      await routinesApi("POST", `/routines/${a.routineId}/run`, {
+        source: "manual",
+        ...(a.payload ?? {}),
+      }),
+  },
+
+  paperclip_routine_set_schedule: {
+    description:
+      "Enable or disable a routine's schedule trigger (auto-firing). ENABLING makes " +
+      "it run on its cron automatically and COSTS CREDIT — this is Bruno's explicit " +
+      "decision; never enable routines on your own initiative. Resolves the " +
+      "schedule trigger from the routine.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        routineId: { type: "string" },
+        enabled: { type: "boolean", description: "true = auto-fire on cron; false = off." },
+      },
+      required: ["routineId", "enabled"],
+    },
+    handler: async (a) => {
+      const routine = await routinesApi("GET", `/routines/${a.routineId}`);
+      const trigs = (routine.triggers ?? routine.routine?.triggers ?? []).filter(
+        (t) => t.kind === "schedule",
+      );
+      if (trigs.length === 0) throw new Error("routine has no schedule trigger");
+      const results = [];
+      for (const t of trigs) {
+        const r = await routinesApi("PATCH", `/routine-triggers/${t.id}`, { enabled: a.enabled });
+        results.push({ triggerId: t.id, enabled: (r.trigger ?? r).enabled });
+      }
+      return { routineId: a.routineId, set: a.enabled, triggers: results };
+    },
+  },
+
+  paperclip_health: {
+    description:
+      "Resilience sweep of the Paperclip control-plane: are the backends reachable, " +
+      "are enabled routines running on time (or did a run fail/never execute), and " +
+      "are any threads (tasks) stuck running. Returns findings ranked by severity. " +
+      "Read-only — the supervisor loop uses this to alert + decide healing actions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        stuck_minutes: {
+          type: "number",
+          description: "Flag threads running longer than this (default 30).",
+        },
+        stale_hours: {
+          type: "number",
+          description: "Flag enabled routines with no completed run within this (default 26).",
+        },
+      },
+    },
+    handler: async (a) => {
+      const stuckMs = (a.stuck_minutes ?? 30) * 60_000;
+      const staleMs = (a.stale_hours ?? 26) * 3_600_000;
+      const now = Date.now();
+      const findings = [];
+      const timed = async (fn) => {
+        const t0 = Date.now();
+        try {
+          const v = await fn();
+          return { ok: true, ms: Date.now() - t0, value: v };
+        } catch (e) {
+          return { ok: false, ms: Date.now() - t0, error: String(e?.message ?? e).slice(0, 200) };
+        }
+      };
+
+      // 1. Backends reachable?
+      const orch = await timed(() => orchGet("/api/orchestration/snapshot"));
+      const rout = await timed(() => routinesApi("GET", `/companies/${COMPANY_ID}/routines`));
+      if (!orch.ok)
+        findings.push({
+          severity: "critical",
+          area: "backend",
+          message: `orchestration (:3773) unreachable: ${orch.error}`,
+        });
+      if (!rout.ok)
+        findings.push({
+          severity: "critical",
+          area: "backend",
+          message: `routines (:3100) unreachable: ${rout.error}`,
+        });
+
+      // 2. Routines: enabled ones running on time?
+      let routinesReport = { total: 0, scheduleEnabled: 0, checked: 0 };
+      if (rout.ok) {
+        const rs = asRoutineList(rout.value);
+        const enabled = rs.filter((r) =>
+          (r.triggers ?? []).some((t) => t.kind === "schedule" && t.enabled),
+        );
+        routinesReport = { total: rs.length, scheduleEnabled: enabled.length, checked: 0 };
+        for (const r of enabled) {
+          const runs = await timed(() => routinesApi("GET", `/routines/${r.id}/runs?limit=5`));
+          if (!runs.ok) continue;
+          routinesReport.checked++;
+          const list = Array.isArray(runs.value)
+            ? runs.value
+            : (runs.value.runs ?? runs.value.data ?? []);
+          const last = list[0];
+          if (!last) {
+            findings.push({
+              severity: "warn",
+              area: "routine",
+              message: `${r.title}: enabled but no run recorded yet`,
+            });
+            continue;
+          }
+          const started = Date.parse(last.completedAt ?? last.createdAt ?? last.triggeredAt ?? "");
+          if (last.status === "failed" || last.failureReason)
+            findings.push({
+              severity: "warn",
+              area: "routine",
+              message: `${r.title}: last run failed (${last.failureReason ?? last.status})`,
+              runId: last.id,
+            });
+          else if (Number.isFinite(started) && now - started > staleMs)
+            findings.push({
+              severity: "warn",
+              area: "routine",
+              message: `${r.title}: no completed run in ${Math.round((now - started) / 3_600_000)}h (schedule may be missing)`,
+            });
+        }
+      }
+
+      // 3. Stuck threads (from the snapshot)
+      let threadsReport = { total: 0, byState: {}, stuck: 0 };
+      if (orch.ok) {
+        const snap = orch.value;
+        const threads = [];
+        const walk = (o) => {
+          if (Array.isArray(o)) return o.forEach(walk);
+          if (o && typeof o === "object") {
+            if (typeof o.threadId === "string" || (o.id && o.title && o.state)) threads.push(o);
+            Object.values(o).forEach(walk);
+          }
+        };
+        walk(snap);
+        const byState = {};
+        for (const t of threads) {
+          const st = t.state ?? t.status ?? "unknown";
+          byState[st] = (byState[st] ?? 0) + 1;
+          const ts = Date.parse(t.latestActivityAt ?? t.updatedAt ?? t.createdAt ?? "");
+          if (["running", "starting"].includes(st) && Number.isFinite(ts) && now - ts > stuckMs) {
+            findings.push({
+              severity: "warn",
+              area: "thread",
+              message: `thread ${String(t.threadId ?? t.id).slice(0, 8)} stuck in '${st}' for ${Math.round((now - ts) / 60_000)}min`,
+              threadId: t.threadId ?? t.id,
+            });
+            threadsReport.stuck++;
+          }
+        }
+        threadsReport.total = threads.length;
+        threadsReport.byState = byState;
+      }
+
+      findings.sort(
+        (x, y) => (x.severity === "critical" ? -1 : 1) - (y.severity === "critical" ? -1 : 1),
+      );
+      return {
+        checkedAt: new Date().toISOString(),
+        healthy: findings.filter((f) => f.severity === "critical").length === 0,
+        backends: {
+          orchestration: { ok: orch.ok, ms: orch.ms },
+          routines: { ok: rout.ok, ms: rout.ms },
+        },
+        routines: routinesReport,
+        threads: threadsReport,
+        findings,
+        note: "MCP client connection state (e.g. qmd/mcp-lumon) is not visible from inside this server; it probes the control-plane backends directly. The scheduling supervisor pairs this with an alert channel.",
+      };
+    },
+  },
+};
+
+// ── JSON-RPC / MCP plumbing ──────────────────────────────────────────────────
+function send(msg) {
+  process.stdout.write(JSON.stringify(msg) + "\n");
+}
+function result(id, res) {
+  send({ jsonrpc: "2.0", id, result: res });
+}
+function error(id, code, message) {
+  send({ jsonrpc: "2.0", id, error: { code, message } });
+}
+
+async function handle(msg) {
+  const { id, method, params } = msg;
+  if (method === "initialize") {
+    return result(id, {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: { tools: {} },
+      serverInfo: SERVER_INFO,
+    });
+  }
+  if (method === "notifications/initialized" || method === "notifications/cancelled") return; // no reply
+  if (method === "ping") return result(id, {});
+  if (method === "tools/list") {
+    return result(id, {
+      tools: Object.entries(TOOLS).map(([name, t]) => ({
+        name,
+        description: t.description,
+        inputSchema: t.inputSchema,
+      })),
+    });
+  }
+  if (method === "tools/call") {
+    const tool = TOOLS[params?.name];
+    if (!tool) return error(id, -32602, `unknown tool: ${params?.name}`);
+    try {
+      const out = await tool.handler(params.arguments ?? {});
+      return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
+    } catch (e) {
+      const detail =
+        e instanceof MegazordDispatchError && e.detail?.responseText
+          ? ` (${e.detail.responseText})`
+          : "";
+      return result(id, {
+        content: [{ type: "text", text: `error: ${e?.message ?? String(e)}${detail}` }],
+        isError: true,
+      });
+    }
+  }
+  if (id !== undefined) return error(id, -32601, `method not found: ${method}`);
+}
+
+// newline-delimited JSON on stdin
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let nl;
+  while ((nl = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (!line) continue;
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    Promise.resolve(handle(msg)).catch((e) => {
+      if (msg?.id !== undefined) error(msg.id, -32603, String(e?.stack ?? e));
+    });
+  }
+});
+process.stdin.on("end", () => process.exit(0));
