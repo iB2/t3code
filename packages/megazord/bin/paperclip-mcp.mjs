@@ -38,6 +38,35 @@ async function orchGet(path) {
   }
 }
 
+// ── Routines/org live on the isolated company instance (Paperclip acp-engine),
+//    a LOCAL unauthenticated HTTP API (default :3100). The 31 native routines
+//    were created by capiva-factory/scripts/native-routines-setup.mjs, all with
+//    their schedule trigger DISABLED (Bruno's credit-safety mandate). Enabling a
+//    routine is Bruno's explicit decision — never auto-enable. ─────────────────
+const ROUTINES_BASE = process.env.PAPERCLIP_ROUTINES_BASE ?? "http://127.0.0.1:3100/api";
+const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID ?? "47ef245e-ff23-41be-a39d-21e4ac66ed2a";
+
+async function routinesApi(method, path, body) {
+  const res = await fetch(`${ROUTINES_BASE}${path}`, {
+    method,
+    headers: body ? { "content-type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = text;
+  }
+  if (!res.ok) throw new Error(`${method} ${path} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
+  return json;
+}
+
+function asRoutineList(d) {
+  return Array.isArray(d) ? d : (d.routines ?? d.data ?? []);
+}
+
 // ── Tools: name -> { description, inputSchema, handler(args) -> object } ──────
 const TOOLS = {
   paperclip_run: {
@@ -143,6 +172,40 @@ const TOOLS = {
       accounts: await client.accounts(),
       usage: await client.usage().catch((e) => `usage unavailable: ${String(e).slice(0, 120)}`),
     }),
+  },
+
+  paperclip_routine_list: {
+    description:
+      "List the native Paperclip routines (recurring work) of the company, with " +
+      "each one's status and whether its schedule trigger is enabled (i.e. will " +
+      "auto-fire). Read-only. Foundation for the resilience monitor.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      const rs = asRoutineList(await routinesApi("GET", `/companies/${COMPANY_ID}/routines`));
+      return {
+        total: rs.length,
+        routines: rs.map((r) => {
+          const sched = (r.triggers ?? []).filter((t) => t.kind === "schedule");
+          return {
+            id: r.id,
+            title: r.title,
+            status: r.status,
+            scheduleEnabled: sched.some((t) => t.enabled),
+            cron: sched.map((t) => t.cronExpression).join(", ") || null,
+          };
+        }),
+      };
+    },
+  },
+
+  paperclip_routine_get: {
+    description: "Get one routine in full (triggers, variables, assignee, policies).",
+    inputSchema: {
+      type: "object",
+      properties: { routineId: { type: "string" } },
+      required: ["routineId"],
+    },
+    handler: async (a) => await routinesApi("GET", `/routines/${a.routineId}`),
   },
 };
 
