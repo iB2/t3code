@@ -207,6 +207,74 @@ const TOOLS = {
     },
     handler: async (a) => await routinesApi("GET", `/routines/${a.routineId}`),
   },
+
+  paperclip_routine_runs: {
+    description:
+      "List the recent runs of a routine (executed/failed/missed). Read-only. The " +
+      "core signal for resilience: detect runs that did not execute or errored.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        routineId: { type: "string" },
+        limit: { type: "number", description: "Max runs (optional)." },
+      },
+      required: ["routineId"],
+    },
+    handler: async (a) =>
+      await routinesApi(
+        "GET",
+        `/routines/${a.routineId}/runs${a.limit ? `?limit=${a.limit}` : ""}`,
+      ),
+  },
+
+  paperclip_routine_run: {
+    description:
+      "Run a routine NOW, ad-hoc (source=manual). Works even when the schedule " +
+      "trigger is disabled — it does NOT enable auto-firing, it is a single manual " +
+      "run. Costs credit for that run.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        routineId: { type: "string" },
+        payload: { type: "object", description: "Optional run payload." },
+      },
+      required: ["routineId"],
+    },
+    handler: async (a) =>
+      await routinesApi("POST", `/routines/${a.routineId}/run`, {
+        source: "manual",
+        ...(a.payload ?? {}),
+      }),
+  },
+
+  paperclip_routine_set_schedule: {
+    description:
+      "Enable or disable a routine's schedule trigger (auto-firing). ENABLING makes " +
+      "it run on its cron automatically and COSTS CREDIT — this is Bruno's explicit " +
+      "decision; never enable routines on your own initiative. Resolves the " +
+      "schedule trigger from the routine.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        routineId: { type: "string" },
+        enabled: { type: "boolean", description: "true = auto-fire on cron; false = off." },
+      },
+      required: ["routineId", "enabled"],
+    },
+    handler: async (a) => {
+      const routine = await routinesApi("GET", `/routines/${a.routineId}`);
+      const trigs = (routine.triggers ?? routine.routine?.triggers ?? []).filter(
+        (t) => t.kind === "schedule",
+      );
+      if (trigs.length === 0) throw new Error("routine has no schedule trigger");
+      const results = [];
+      for (const t of trigs) {
+        const r = await routinesApi("PATCH", `/routine-triggers/${t.id}`, { enabled: a.enabled });
+        results.push({ triggerId: t.id, enabled: (r.trigger ?? r).enabled });
+      }
+      return { routineId: a.routineId, set: a.enabled, triggers: results };
+    },
+  },
 };
 
 // ── JSON-RPC / MCP plumbing ──────────────────────────────────────────────────
