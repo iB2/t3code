@@ -199,10 +199,13 @@ async function main() {
     );
   }
   console.log(JSON.stringify(report));
-  // Set exitCode (don't process.exit): the token mint spawns a child process, and
+  // Exit 0 whenever the sweep RAN (healthy or with findings — findings are
+  // delivered via the alert + health.json, not the exit code). A dead-man's-switch
+  // watching this task wants 0 = "it ran"; only a real run failure (the catch
+  // below) is non-zero, so findings don't get mistaken for the monitor failing.
+  // exitCode (not process.exit): the token mint spawns a child process, and
   // forcing teardown while its handle closes trips a libuv assertion on Windows.
-  // Letting the event loop drain closes handles cleanly.
-  process.exitCode = report.criticals > 0 ? 2 : report.findings.length > 0 ? 1 : 0;
+  process.exitCode = 0;
 }
 
 main().catch((e) => {
