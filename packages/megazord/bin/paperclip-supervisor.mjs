@@ -185,18 +185,42 @@ async function main() {
     () => {},
   );
 
+  // Dedup/backoff: NUNCA re-alerta o mesmo problema a cada sweep (isso inundava
+  // o grupo de controle enquanto um backend ficava fora). Alerta só quando o
+  // conjunto de findings MUDA, ou como lembrete no máx 1x/h se persistir; e
+  // manda UM aviso de recuperação quando volta ao saudável.
+  const stateFile = nodePath.join(REPORT_DIR, "alert-state.json");
+  const prev = JSON.parse(await readFile(stateFile, "utf8").catch(() => "{}")) || {};
+  const BACKOFF_MS = 60 * 60_000;
+  const now = Date.now();
   if (report.findings.length > 0) {
-    const lines = report.findings.map(
-      (f) => `${f.severity === "critical" ? "🔴" : "⚠️"} [${f.area}] ${f.message}`,
-    );
-    const healedLine = report.healed.length
-      ? `\n\nself-heal: ${report.healed.map((h) => `${h.routine} retry=${h.retried}`).join("; ")}`
-      : "";
-    await alert(
-      `[paperclip supervisor] ${report.criticals} crítico(s), ${report.findings.length} finding(s):\n` +
-        lines.join("\n") +
-        healedLine,
-    );
+    const sig = report.findings
+      .map((f) => `${f.severity}:${f.area}:${f.message}`)
+      .sort()
+      .join("|");
+    const changed = prev.sig !== sig;
+    const stale = !prev.lastAlertAt || now - prev.lastAlertAt > BACKOFF_MS;
+    if (changed || stale) {
+      const lines = report.findings.map(
+        (f) => `${f.severity === "critical" ? "🔴" : "⚠️"} [${f.area}] ${f.message}`,
+      );
+      const healedLine = report.healed.length
+        ? `\n\nself-heal: ${report.healed.map((h) => `${h.routine} retry=${h.retried}`).join("; ")}`
+        : "";
+      const since = changed ? now : prev.since || now;
+      const repeat =
+        !changed && stale ? ` (persiste há ${Math.round((now - since) / 60000)}min)` : "";
+      await alert(
+        `[paperclip supervisor] ${report.criticals} crítico(s), ${report.findings.length} finding(s)${repeat}:\n` +
+          lines.join("\n") +
+          healedLine,
+      );
+      await writeFile(stateFile, JSON.stringify({ sig, lastAlertAt: now, since })).catch(() => {});
+    }
+  } else if (prev.sig) {
+    // estava alertando e recuperou: um aviso, depois silêncio.
+    await alert("[paperclip supervisor] ✅ recuperado — backends OK.").catch(() => {});
+    await writeFile(stateFile, "{}").catch(() => {});
   }
   console.log(JSON.stringify(report));
   // Set exitCode (don't process.exit): the token mint spawns a child process, and
