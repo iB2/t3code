@@ -38,7 +38,12 @@ const argv = process.argv.slice(2);
 const DRY_RUN = argv.includes("--dry-run");
 const HEAL = argv.includes("--heal");
 
-const client = new MegazordT3DispatchClient({});
+// Mint baseline measured against the live backend is ~4.5s; the client default of
+// 60s means a HUNG mint subprocess pins the whole sweep before the retry even
+// starts. Fail fast at ~4x the baseline so retry + probe still fit in one sweep.
+// Supervisor-local on purpose: the real dispatch path keeps the global default.
+const MINT_TIMEOUT_MS = 20_000;
+const client = new MegazordT3DispatchClient({ mintTimeoutMs: MINT_TIMEOUT_MS });
 
 async function orchGet(path) {
   const origin = await client.origin();
