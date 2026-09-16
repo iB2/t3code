@@ -20,6 +20,7 @@ import { MegazordT3DispatchClient } from "../src/dispatch.ts";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import * as os from "node:os";
 import * as nodePath from "node:path";
+import { pathToFileURL } from "node:url";
 
 const ROUTINES_BASE = process.env.PAPERCLIP_ROUTINES_BASE ?? "http://127.0.0.1:3100/api";
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID ?? "47ef245e-ff23-41be-a39d-21e4ac66ed2a";
@@ -37,7 +38,12 @@ const argv = process.argv.slice(2);
 const DRY_RUN = argv.includes("--dry-run");
 const HEAL = argv.includes("--heal");
 
-const client = new MegazordT3DispatchClient({});
+// Mint baseline measured against the live backend is ~4.5s; the client default of
+// 60s means a HUNG mint subprocess pins the whole sweep before the retry even
+// starts. Fail fast at ~4x the baseline so retry + probe still fit in one sweep.
+// Supervisor-local on purpose: the real dispatch path keeps the global default.
+const MINT_TIMEOUT_MS = 20_000;
+const client = new MegazordT3DispatchClient({ mintTimeoutMs: MINT_TIMEOUT_MS });
 
 async function orchGet(path) {
   const origin = await client.origin();
@@ -57,26 +63,82 @@ async function routinesApi(method, path, body) {
 }
 const asList = (d) => (Array.isArray(d) ? d : (d?.routines ?? d?.data ?? []));
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function timed(fn) {
+  const t0 = Date.now();
+  try {
+    return { ok: true, ms: Date.now() - t0, value: await fn() };
+  } catch (e) {
+    return { ok: false, ms: Date.now() - t0, error: String(e?.message ?? e).slice(0, 200) };
+  }
+}
+
+// A check that fails once under machine load (mint subprocess contention, a slow
+// backend) shouldn't page anyone. Try twice, short backoff between, before a
+// check counts as failed. Only fires the alert path if BOTH attempts fail.
+const RETRY_BACKOFF_MS = 2_500;
+async function timedWithRetry(
+  fn,
+  { attempts = 2, backoffMs = RETRY_BACKOFF_MS, wait = sleep } = {},
+) {
+  let result;
+  for (let i = 0; i < attempts; i++) {
+    result = await timed(fn);
+    if (result.ok) return result;
+    if (i < attempts - 1) await wait(backoffMs);
+  }
+  return result;
+}
+
+const PROBE_TIMEOUT_MS = 5_000;
+/** Cheap, unauthenticated liveness probe: does the origin answer at all? Used to
+ * tell "backend is actually down" apart from "the token mint was slow/timed out
+ * while the server kept serving requests" — the latter is not a critical. */
+async function probeOrigin(origin, { fetchImpl = fetch, timeoutMs = PROBE_TIMEOUT_MS } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(`${origin}/`, { signal: controller.signal });
+    return { reachable: true, status: res.status };
+  } catch (e) {
+    return { reachable: false, error: String(e?.message ?? e).slice(0, 200) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Classify an orchestration check failure using the origin probe result. */
+function classifyOrchFailure(orch, probe) {
+  if (probe.reachable) {
+    return {
+      severity: "warn",
+      area: "backend",
+      message: `orchestration (:3773) mint lento (${orch.ms}ms) — backend responde (HTTP ${probe.status}): ${orch.error}`,
+    };
+  }
+  return {
+    severity: "critical",
+    area: "backend",
+    message: `orchestration (:3773) down: ${orch.error}`,
+  };
+}
+
 async function sweep({ stuckMs = 30 * 60_000, staleMs = 26 * 3_600_000 } = {}) {
   const now = Date.now();
   const findings = [];
-  const timed = async (fn) => {
-    const t0 = Date.now();
-    try {
-      return { ok: true, ms: Date.now() - t0, value: await fn() };
-    } catch (e) {
-      return { ok: false, ms: Date.now() - t0, error: String(e?.message ?? e).slice(0, 200) };
-    }
-  };
 
-  const orch = await timed(() => orchGet("/api/orchestration/snapshot"));
-  const rout = await timed(() => routinesApi("GET", `/companies/${COMPANY_ID}/routines`));
-  if (!orch.ok)
-    findings.push({
-      severity: "critical",
-      area: "backend",
-      message: `orchestration (:3773) down: ${orch.error}`,
-    });
+  const orch = await timedWithRetry(() => orchGet("/api/orchestration/snapshot"));
+  const rout = await timedWithRetry(() => routinesApi("GET", `/companies/${COMPANY_ID}/routines`));
+  if (!orch.ok) {
+    let probe;
+    try {
+      probe = await probeOrigin(await client.origin());
+    } catch (e) {
+      probe = { reachable: false, error: String(e?.message ?? e).slice(0, 200) };
+    }
+    findings.push(classifyOrchFailure(orch, probe));
+  }
   if (!rout.ok)
     findings.push({
       severity: "critical",
@@ -229,7 +291,15 @@ async function main() {
   process.exitCode = report.criticals > 0 ? 2 : report.findings.length > 0 ? 1 : 0;
 }
 
-main().catch((e) => {
-  console.error(String(e?.stack ?? e));
-  process.exitCode = 3;
-});
+// Guarded so the module can be `import`ed (for unit tests) without running the
+// real sweep against live backends / sending an alert.
+const isMain =
+  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  main().catch((e) => {
+    console.error(String(e?.stack ?? e));
+    process.exitCode = 3;
+  });
+}
+
+export { timed, timedWithRetry, probeOrigin, classifyOrchFailure, sweep };
