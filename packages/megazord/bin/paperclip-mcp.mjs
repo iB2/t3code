@@ -89,6 +89,12 @@ const TOOLS = {
           description: "Force a harness (optional).",
         },
         model: { type: "string", description: "Pin the thread model (optional)." },
+        instance: {
+          type: "string",
+          description:
+            "Pin one account by instanceId (optional; see paperclip_accounts), e.g. " +
+            "claudeAgent_claude_pessoal. Never the SSB account for general work.",
+        },
         project_title: { type: "string", description: "Target project by exact title (optional)." },
         title: { type: "string", description: "Thread title shown in the cockpit (optional)." },
         runtime: { type: "string", description: "Runtime mode (default full-access)." },
@@ -103,6 +109,7 @@ const TOOLS = {
         runtimeMode: a.runtime ?? "full-access",
         ...(a.driver ? { driver: a.driver } : {}),
         ...(a.model ? { model: a.model } : {}),
+        ...(a.instance ? { instance: a.instance } : {}),
         ...(a.project_title ? { projectTitle: a.project_title } : {}),
         ...(a.title ? { title: a.title } : {}),
       });
