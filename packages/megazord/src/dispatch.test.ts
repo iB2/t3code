@@ -141,6 +141,35 @@ describe("selectInstance — general pool (capability + quota)", () => {
   });
 });
 
+describe("selectInstance — account pin (instance)", () => {
+  const WITH_PESSOAL: ReadonlyArray<ProviderInstanceAccount> = [
+    ...ACCOUNTS,
+    {
+      instanceId: "claudeAgent_claude_pessoal",
+      driver: "claudeAgent",
+      displayName: "Claude Pessoal",
+      enabled: true,
+    },
+  ];
+
+  it("routes to the pinned second login instead of the first in config order", () => {
+    const d = selectInstance({
+      accounts: WITH_PESSOAL,
+      scope: "general",
+      driver: "claudeAgent",
+      instance: "claudeAgent_claude_pessoal",
+    });
+    expect(d.instanceId).toBe("claudeAgent_claude_pessoal");
+    expect(d.reason).toContain("instance pinned=claudeAgent_claude_pessoal");
+  });
+
+  it("refuses to pin the SSB account for general work", () => {
+    expect(() =>
+      selectInstance({ accounts: WITH_PESSOAL, scope: "general", instance: "claudeAgent" }),
+    ).toThrow(/not an enabled general account/);
+  });
+});
+
 describe("selectInstance — connector capability (needs)", () => {
   it("routes a needs request to the instance exposing the connector", () => {
     const d = selectInstance({
@@ -214,6 +243,7 @@ function makeFetchStub(): {
             id: threadId,
             deletedAt: threadId === "deleted" ? "2026-09-13T00:00:00.000Z" : null,
             archivedAt: null,
+            modelSelection: { instanceId: "claudeAgent_claude_capiva", model: "claude-opus-5-5" },
             latestTurn: {
               turnId: "turn-1",
               state: "completed",
@@ -533,6 +563,43 @@ describe("continuing a thread", () => {
       c.sendTurnAndAwait({ threadId: "  ", task: "x", scope: "general" }),
     ).rejects.toBeInstanceOf(MegazordDispatchError);
     expect(calls.length).toBe(0);
+  });
+});
+
+describe("continuing a thread keeps its account", () => {
+  it("sends the turn on the thread's own account even when the policy would pick another", async () => {
+    const { fetchImpl, calls } = makeFetchStub();
+    const c = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS, // config order puts codex first
+      fetchImpl,
+    });
+    // The stub never completes a new turn: a short wait keeps the test fast; only the account of the sent turn matters here.
+    const out = await c.sendTurnAndAwait({ threadId: "th-existing", task: "status?", timeoutMs: 200, pollMs: 20 });
+    expect(out.threadId).toBe("th-existing");
+    const turn = calls.find((call) => call.url.endsWith("/dispatch"))!.body as {
+      modelSelection: { instanceId: string; model: string };
+    };
+    expect(turn.modelSelection).toEqual({
+      instanceId: "claudeAgent_claude_capiva",
+      model: "claude-opus-5-5",
+    });
+  });
+
+  it("refuses to move a thread to another account", async () => {
+    const { fetchImpl } = makeFetchStub();
+    const c = new MegazordT3DispatchClient({
+      origin: "http://127.0.0.1:3773",
+      token: "TESTTOKEN",
+      environmentId: "env-1",
+      accounts: ACCOUNTS,
+      fetchImpl,
+    });
+    await expect(
+      c.dispatch({ task: "x", scope: "general", threadId: "th-existing", instance: "codex" }),
+    ).rejects.toThrow(/cannot move it to another account/);
   });
 });
 
