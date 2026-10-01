@@ -576,7 +576,8 @@ describe("continuing a thread keeps its account", () => {
       accounts: ACCOUNTS, // config order puts codex first
       fetchImpl,
     });
-    const out = await c.sendTurnAndAwait({ threadId: "th-existing", task: "status?", timeoutMs: 5000 });
+    // The stub never completes a new turn: a short wait keeps the test fast; only the account of the sent turn matters here.
+    const out = await c.sendTurnAndAwait({ threadId: "th-existing", task: "status?", timeoutMs: 200, pollMs: 20 });
     expect(out.threadId).toBe("th-existing");
     const turn = calls.find((call) => call.url.endsWith("/dispatch"))!.body as {
       modelSelection: { instanceId: string; model: string };
