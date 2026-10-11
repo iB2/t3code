@@ -31,6 +31,7 @@
  *   node bin/t3-chair.mjs answer --thread <id> --answer "<text>" --why "<reason>" [--request <id>]
  *   node bin/t3-chair.mjs approve --thread <id> --request <id> --decision accept|decline --why "<reason>"
  *   node bin/t3-chair.mjs interrupt --thread <id> --why "<reason>"
+ *   node bin/t3-chair.mjs settle --thread <id> --why "<reason>"
  *   node bin/t3-chair.mjs wait --thread <id> [--since <iso>] [--timeout-seconds 900]
  *   node bin/t3-chair.mjs log [--tail 20]
  *
@@ -430,6 +431,24 @@ const VERBS = {
         commandId: randomUUID(),
         threadId: row.id,
         createdAt: new Date().toISOString(),
+      });
+      return { threadId: row.id, sequence };
+    });
+  },
+
+  /** Close a thread whose work is finished, so it leaves the inbox. */
+  async settle(session, args) {
+    need(args, "thread");
+    const row = resolveThread(session, args.thread);
+    const state = await stateOf(session, row);
+    if (["running", "question", "approval"].includes(state.status)) {
+      throw new ChairRefusal(`refused: thread '${row.id}' is ${state.status}, not finished`);
+    }
+    return decide(session, args, { threadId: row.id }, async () => {
+      const sequence = await session.post({
+        type: "thread.settle",
+        commandId: randomUUID(),
+        threadId: row.id,
       });
       return { threadId: row.id, sequence };
     });
