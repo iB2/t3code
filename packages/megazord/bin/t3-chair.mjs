@@ -35,6 +35,9 @@
  *   node bin/t3-chair.mjs wait --thread <id> [--since <iso>] [--timeout-seconds 900]
  *   node bin/t3-chair.mjs log [--tail 20]
  *
+ * `--task-file <path>` and `--answer-file <path>` read the text from a UTF-8 file
+ * instead of the command line; use them for anything longer than one line.
+ *
  * The token is minted at runtime and NEVER written to disk.
  *
  * @module megazord/bin/t3-chair
@@ -78,6 +81,8 @@ const VALUE_FLAGS = new Set([
   "timeout-seconds",
   "tail",
   "base-dir",
+  "task-file",
+  "answer-file",
 ]);
 const BOOL_FLAGS = new Set(["wait", "no-start", "help"]);
 const APPROVAL_DECISIONS = ["accept", "acceptForSession", "acceptAlways", "decline", "cancel"];
@@ -497,6 +502,11 @@ async function main() {
   const verb = Object.hasOwn(VERBS, args.verb) ? VERBS[args.verb] : undefined;
   if (verb === undefined) usage(`unknown verb: ${args.verb}`);
   try {
+    // A brief is long and multi-line; a shell argument is a bad carrier for it.
+    for (const name of ["task", "answer"]) {
+      const file = args[`${name}-file`];
+      if (file !== undefined) args[name] = await readFile(file, "utf8");
+    }
     print(await verb(await openSession(args), args));
   } catch (e) {
     if (e instanceof ChairRefusal || (e instanceof MegazordDispatchError && e.refusal)) {
