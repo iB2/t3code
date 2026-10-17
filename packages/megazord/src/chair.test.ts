@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   ChairRefusal,
   assertInstanceAllowed,
+  classifyMcpThread,
   classifyThread,
   parsePolicy,
   pendingApprovals,
@@ -31,6 +32,19 @@ describe("parsePolicy", () => {
       ChairRefusal,
     );
     expect(() => parsePolicy(null)).toThrow(ChairRefusal);
+  });
+
+  it("gives another machine no access until the policy names it, and never reuses this machine's lists", () => {
+    const raw = {
+      blockedProjectIds: ["client-project"],
+      blockedInstanceIds: ["client-account"],
+      environments: { mac: { blockedProjectIds: [], blockedInstanceIds: ["mac-client-account"] } },
+    };
+    expect(() => parsePolicy(raw, "phone")).toThrow(ChairRefusal);
+    expect(() => parsePolicy({ ...raw, environments: { mac: {} } }, "mac")).toThrow(ChairRefusal);
+    const mac = parsePolicy(raw, "mac");
+    expect(mac.blockedInstanceIds).toEqual(["mac-client-account"]);
+    expect(parsePolicy(raw).blockedInstanceIds).toEqual(["client-account"]);
   });
 });
 
@@ -107,5 +121,40 @@ describe("classifyThread", () => {
     const failed = thread({ latestTurn: { turnId: "turn-1", state: "error" } });
     expect(classifyThread(failed, []).status).toBe("error");
     expect(classifyThread(thread(), []).status).toBe("empty");
+  });
+});
+
+describe("classifyMcpThread", () => {
+  const row = (over: Record<string, unknown> = {}) => ({
+    threadId: "t1",
+    status: "idle",
+    latestRunId: "run-1",
+    itemCount: 4,
+    settled: false,
+    ...over,
+  });
+
+  it("finds a run blocked on a person although T3 still reports it running", () => {
+    const blocked = row({ status: "running", pendingRequestCount: 1 });
+    const question = { requestId: "r1", questions: [] };
+    const asked = classifyMcpThread(blocked, question);
+    expect(asked.status).toBe("question");
+    expect(asked.pendingInput?.requestId).toBe("r1");
+    expect(classifyMcpThread(blocked).status).toBe("approval");
+    expect(classifyMcpThread(row({ status: "running", pendingRequestCount: 0 })).status).toBe(
+      "running",
+    );
+  });
+
+  it("keeps threads migrated from before 0.1.0 as idle, not empty", () => {
+    expect(classifyMcpThread(row({ latestRunId: null, itemCount: 17 })).status).toBe("idle");
+    expect(classifyMcpThread(row({ latestRunId: null, itemCount: 0 })).status).toBe("empty");
+  });
+
+  it("puts a settled thread out of the inbox whatever its last run did", () => {
+    expect(classifyMcpThread(row({ status: "failed", settled: true })).status).toBe("done");
+    expect(classifyMcpThread(row({ status: "failed" })).status).toBe("error");
+    expect(classifyMcpThread(row({ status: "cancelled" })).status).toBe("interrupted");
+    expect(classifyMcpThread(row({ status: "queued" })).status).toBe("running");
   });
 });

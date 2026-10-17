@@ -3,6 +3,10 @@
  * external orchestrator (a "chair") uses to run the local T3: see what needs a
  * decision, read a thread, and act on it.
  *
+ * Since T3 0.1.0 the chair reads threads through T3's MCP (`./mcp.ts`), so the
+ * status comes from {@link classifyMcpThread}; {@link classifyThread} reads the
+ * pre-0.1.0 snapshot shape that the other megazord CLIs still use.
+ *
  * Two things live here because they must not depend on I/O:
  *
  *  - **The fence.** The chair is a remote agent, so whatever it reads leaves the
@@ -39,12 +43,34 @@ function idList(raw: unknown, field: string): ReadonlyArray<string> {
   return raw.map((v) => (v as string).trim());
 }
 
-/** Parse the policy file. Fail-closed: both fields are required, even if empty. */
-export function parsePolicy(raw: unknown): ChairPolicy {
+/**
+ * Parse the policy file for one environment. Fail-closed: both fields are
+ * required, even if empty.
+ *
+ * The top-level lists are the `local` environment's, so a policy written before
+ * there was more than one machine keeps meaning the same thing. Any other
+ * environment needs its own entry under `environments`: ids differ per machine
+ * (the same account can sit under another instance id there), so reusing this
+ * machine's lists could leave a client account open. No entry, no access.
+ */
+export function parsePolicy(raw: unknown, environment = "local"): ChairPolicy {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new ChairRefusal("refused: chair policy must be a JSON object");
   }
-  const r = raw as Record<string, unknown>;
+  let r = raw as Record<string, unknown>;
+  if (environment !== "local") {
+    const envs = r["environments"];
+    const entry =
+      envs !== null && typeof envs === "object" && !Array.isArray(envs)
+        ? (envs as Record<string, unknown>)[environment]
+        : undefined;
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new ChairRefusal(
+        `refused: the chair policy has no entry for environment '${environment}'`,
+      );
+    }
+    r = entry as Record<string, unknown>;
+  }
   return {
     blockedProjectIds: idList(r["blockedProjectIds"], "blockedProjectIds"),
     blockedInstanceIds: idList(r["blockedInstanceIds"], "blockedInstanceIds"),
@@ -184,4 +210,54 @@ export function classifyThread(thread: Row, activities: ReadonlyArray<Row>): Cha
   if (turnState === "interrupted") return { status: "interrupted", turnId };
   if (turnRow === undefined) return { status: "empty", turnId };
   return { status: "idle", turnId };
+}
+
+/**
+ * Classify a thread row from T3's MCP (`t3_thread_list` / `t3_thread_read`),
+ * which reports the latest run's durable status instead of turns and activities.
+ *
+ * A run blocked on a person still reports `running` (or `waiting`); what tells
+ * it apart is `pendingRequestCount`, which only `t3_thread_read` carries. With
+ * a pending question (pass it as `pendingInput`) the thread is a `question`;
+ * with requests but no question it is a permission approval, which the MCP can
+ * neither answer nor describe, so that case only flags it.
+ */
+export function classifyMcpThread(thread: Row, pendingInput?: PendingUserInput): ChairThreadState {
+  const turnId = String(thread["latestRunId"] ?? "");
+  const status = String(thread["status"] ?? "");
+  if (thread["settled"] === true) return { status: "done", turnId };
+  switch (status) {
+    case "preparing":
+    case "queued":
+    case "starting":
+    case "running":
+    case "waiting":
+      if (pendingInput !== undefined) return { status: "question", turnId, pendingInput };
+      if (status !== "waiting" && Number(thread["pendingRequestCount"] ?? 0) === 0) {
+        return { status: "running", turnId };
+      }
+      return {
+        status: "approval",
+        turnId,
+        pendingApprovals: [
+          {
+            requestId: "",
+            requestKind: "approval",
+            detail: "the agent is waiting for a permission approval; answer it in the T3 app",
+          },
+        ],
+      };
+    case "failed":
+      return { status: "error", turnId };
+    case "interrupted":
+    case "cancelled":
+    case "rolled_back":
+      return { status: "interrupted", turnId };
+    default:
+      // `completed`, or `idle` on a thread that already has a conversation
+      // (threads migrated from before 0.1.0 report idle with no run id).
+      return Number(thread["itemCount"] ?? 0) > 0 || turnId !== ""
+        ? { status: "idle", turnId }
+        : { status: "empty", turnId };
+  }
 }
