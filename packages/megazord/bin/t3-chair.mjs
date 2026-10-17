@@ -30,12 +30,13 @@
  * Usage:
  *   node bin/t3-chair.mjs login [--env <name>] [--no-browser]
  *   node bin/t3-chair.mjs envs
+ *   node bin/t3-chair.mjs accounts
  *   node bin/t3-chair.mjs projects
  *   node bin/t3-chair.mjs inbox [--project <id|title>]
  *   node bin/t3-chair.mjs threads --project <id|title> [--status <s>] [--limit 30]
  *   node bin/t3-chair.mjs read --thread <id> [--messages 6] [--chars 4000]
  *   node bin/t3-chair.mjs open --project <id|title> --title "<t>" --task "<brief>" --why "<reason>"
- *        [--instance <id>] [--model <id>] [--runtime <mode>] [--no-start]
+ *        [--account "<name>" | --instance <id>] [--model <id>] [--runtime <mode>] [--no-start]
  *   node bin/t3-chair.mjs continue --thread <id> --task "<text>" --why "<reason>"
  *        [--wait] [--timeout-seconds 900]
  *   node bin/t3-chair.mjs answer --thread <id> --answer "<text>" --why "<reason>" [--request <id>]
@@ -45,6 +46,9 @@
  *   node bin/t3-chair.mjs log [--tail 20]
  *
  * Every verb that touches threads takes `--env <name>`.
+ *
+ * Accounts are shown and chosen by display name (`account`, e.g. "Claude
+ * Pessoal"): the instance id behind a name differs from machine to machine.
  *
  * `approve` is kept as a verb but always refuses: T3's MCP cannot answer
  * permission approvals, so they are answered in the T3 app.
@@ -90,6 +94,7 @@ const VALUE_FLAGS = new Set([
   "task",
   "why",
   "instance",
+  "account",
   "model",
   "runtime",
   "answer",
@@ -240,7 +245,44 @@ async function openSession(args) {
     return row;
   };
 
-  return { baseDir, env, policy, mcp, projects, listThreads, getThread, url };
+  // Instance ids differ per machine (the same account can be `claudeAgent` on
+  // one and `claudeAgent_3` on another); the display name is what stays the
+  // same, so that is what the chair shows and accepts.
+  let providers;
+  const allProviders = async () => {
+    providers ??= (await mcp.call("orchestrator_capabilities")).providers ?? [];
+    return providers;
+  };
+  /** Accounts a thread can run on here: enabled, with models, outside the fence. */
+  const accounts = async () =>
+    (await allProviders())
+      .filter(
+        (p) =>
+          (p.models ?? []).length > 0 &&
+          (p.constraints ?? []).length === 0 &&
+          !policy.blockedInstanceIds.includes(p.providerInstanceId),
+      )
+      .map((p) => ({
+        account: p.displayName ?? p.providerInstanceId,
+        instanceId: p.providerInstanceId,
+        models: p.models.map((m) => m.id),
+      }));
+  const accountName = async (instanceId) =>
+    (await allProviders()).find((p) => p.providerInstanceId === instanceId)?.displayName ??
+    instanceId;
+
+  return {
+    baseDir,
+    env,
+    policy,
+    mcp,
+    projects,
+    listThreads,
+    getThread,
+    url,
+    accounts,
+    accountName,
+  };
 }
 
 function resolveProject(session, ref) {
@@ -313,6 +355,7 @@ async function summarize(session, row, state) {
     title: row.title,
     status: state.status,
     updatedAt: row.updatedAt,
+    account: await session.accountName(row.modelSelection.instanceId),
     instanceId: row.modelSelection.instanceId,
     model: row.modelSelection.model,
     runtimeMode: row.runtimeMode,
@@ -517,6 +560,11 @@ const LOCAL_VERBS = {
 };
 
 const VERBS = {
+  /** The accounts a new thread can run on in this environment, by name. */
+  async accounts(session) {
+    return session.accounts();
+  },
+
   async projects(session) {
     const out = [];
     for (const p of session.projects) {
@@ -594,6 +642,20 @@ const VERBS = {
   async open(session, args) {
     need(args, "project", "title", "task");
     const project = resolveProject(session, args.project);
+    if (args.account !== undefined && args.instance !== undefined) {
+      usage("pass --account or --instance, not both");
+    }
+    if (args.account !== undefined) {
+      const wanted = args.account.trim().toLowerCase();
+      const available = await session.accounts();
+      const match = available.find((a) => a.account.toLowerCase() === wanted);
+      if (match === undefined) {
+        throw new ChairRefusal(
+          `refused: no account '${args.account}' on '${session.env.name}'; available: ${available.map((a) => a.account).join(", ")}`,
+        );
+      }
+      args.instance = match.instanceId;
+    }
     if (args.instance !== undefined) assertInstanceAllowed(session.policy, args.instance);
     const runtimeMode = args.runtime ?? "full-access";
     if (!RUNTIME_MODES.includes(runtimeMode)) usage(`--runtime must be one of ${RUNTIME_MODES}`);
@@ -601,9 +663,8 @@ const VERBS = {
     if (args.instance !== undefined) {
       let model = args.model;
       if (model === undefined) {
-        const caps = await session.mcp.call("orchestrator_capabilities");
-        const provider = (caps.providers ?? []).find((p) => p.providerInstanceId === args.instance);
-        model = provider?.models?.[0]?.id;
+        const provider = (await session.accounts()).find((a) => a.instanceId === args.instance);
+        model = provider?.models?.[0];
         if (model === undefined) {
           throw new ChairRefusal(
             `refused: instance '${args.instance}' has no available model here`,
@@ -647,6 +708,7 @@ const VERBS = {
       }
       return {
         threadId,
+        account: await session.accountName(instanceId),
         instanceId,
         model: body.thread?.model ?? "",
         started: !args["no-start"],
