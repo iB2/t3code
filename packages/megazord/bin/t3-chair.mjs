@@ -39,7 +39,7 @@
  *        [--account "<name>" | --instance <id>] [--model <id>] [--runtime <mode>] [--no-start]
  *        [--base <branch> | --in-place] [--effort <level>]
  *   node bin/t3-chair.mjs continue --thread <id> --task "<text>" --why "<reason>"
- *        [--wait] [--timeout-seconds 900]
+ *        [--wait] [--timeout-seconds 900] [--effort <level>]
  *   node bin/t3-chair.mjs answer --thread <id> --answer "<text>" --why "<reason>" [--request <id>]
  *   node bin/t3-chair.mjs interrupt --thread <id> --why "<reason>"
  *   node bin/t3-chair.mjs settle --thread <id> --why "<reason>"
@@ -47,6 +47,11 @@
  *   node bin/t3-chair.mjs log [--tail 20]
  *
  * Every verb that touches threads takes `--env <name>`.
+ *
+ * `open` sets the model's effort to `high` unless `--effort` says otherwise (it
+ * needs `--account` to know the model; without one T3's project default
+ * stands). `continue --effort` changes an existing thread's level from that
+ * turn on. `read` reports the level a thread is set to.
  *
  * `open` gives each new thread its own worktree, branched from
  * `origin/<base>` (default `main`), so threads in the same project can run side
@@ -118,9 +123,11 @@ const VALUE_FLAGS = new Set([
 const BOOL_FLAGS = new Set(["wait", "no-start", "no-browser", "in-place", "help"]);
 const RUNTIME_MODES = ["approval-required", "auto-accept-edits", "auto", "full-access"];
 
+/** A malformed command (exit 2). Thrown, never exit()ed: see main. */
+class ChairUsage extends Error {}
+
 function usage(message) {
-  console.error(`t3-chair: ${message}`);
-  process.exit(2);
+  throw new ChairUsage(message);
 }
 
 function parseArgs(argv) {
@@ -520,6 +527,25 @@ async function waitOutcome(session, threadId, runId, timeoutMs) {
   };
 }
 
+const DEFAULT_EFFORT = "high";
+
+/** Refuse an effort level the model does not offer on this machine. */
+async function assertEffort(session, instanceId, model, effort) {
+  const levels = await session.effortLevels(instanceId, model);
+  if (!levels.includes(effort)) {
+    usage(
+      `--effort for ${model} must be one of ${levels.join(", ") || "(none: this model has no effort setting)"}`,
+    );
+  }
+}
+
+/** The effort a thread is set to, as T3 recorded it. */
+async function threadEffort(session, threadId) {
+  const config = await session.mcp.call("t3_thread_configuration", { threadId });
+  const option = (config.modelSelection?.options ?? []).find((o) => o.id === "effort");
+  return option?.value ?? "model default";
+}
+
 /**
  * Wait for T3 to finish preparing a new thread's worktree. Launching returns
  * before the worktree exists, and a bad base branch only fails afterwards, so
@@ -684,7 +710,12 @@ const VERBS = {
     const messages = (
       await lastMessages(session, row.id, count, chars, Number(row.mcp.itemCount ?? 0))
     ).map((m) => ({ ...m, text: clip(m.text, chars) }));
-    return { ...(await summarize(session, row, state)), branch: row.branch, messages };
+    return {
+      ...(await summarize(session, row, state)),
+      effort: await threadEffort(session, row.id),
+      branch: row.branch,
+      messages,
+    };
   },
 
   async open(session, args) {
@@ -723,17 +754,23 @@ const VERBS = {
     } else if (args.model !== undefined) {
       modelSelection = { model: args.model };
     }
-    // Without options a model runs at its own default effort, not the one the
-    // app's composer would pick; the app settings do not apply here.
+    // Without options a model runs at its own default effort (medium for Opus
+    // 5.5), not the level the app's composer is set to: the desktop settings
+    // never reach a thread opened over MCP. So `open` asks for DEFAULT_EFFORT
+    // unless told otherwise, whenever it knows the account and the model has
+    // that level. With no account it cannot know the model, so it leaves T3's
+    // project default alone.
+    let effort;
     if (args.effort !== undefined) {
       if (modelSelection?.instanceId === undefined) usage("--effort needs --account (or --instance)");
+      await assertEffort(session, modelSelection.instanceId, modelSelection.model, args.effort);
+      effort = args.effort;
+    } else if (modelSelection?.instanceId !== undefined) {
       const levels = await session.effortLevels(modelSelection.instanceId, modelSelection.model);
-      if (!levels.includes(args.effort)) {
-        usage(
-          `--effort for ${modelSelection.model} must be one of ${levels.join(", ") || "(none: this model has no effort setting)"}`,
-        );
-      }
-      modelSelection = { ...modelSelection, options: [{ id: "effort", value: args.effort }] };
+      if (levels.includes(DEFAULT_EFFORT)) effort = DEFAULT_EFFORT;
+    }
+    if (effort !== undefined) {
+      modelSelection = { ...modelSelection, options: [{ id: "effort", value: effort }] };
     }
     if (args["in-place"] && args.base !== undefined) usage("pass --base or --in-place, not both");
     const base = args.base ?? "main";
@@ -790,7 +827,7 @@ const VERBS = {
         account: await session.accountName(instanceId),
         instanceId,
         model: body.thread?.model ?? "",
-        ...(args.effort !== undefined ? { effort: args.effort } : {}),
+        effort: effort ?? "model default",
         workspace: args["in-place"] ? "in-place" : `worktree from origin/${base}`,
         started: !args["no-start"],
         url: await session.url(threadId),
@@ -802,7 +839,23 @@ const VERBS = {
     need(args, "thread", "task");
     const row = await session.getThread(args.thread);
     const timeoutMs = intFlag(args, "timeout-seconds", 900) * 1000;
-    return decide(session, args, { threadId: row.id }, async (decisionId) => {
+    // `--effort` changes the thread's own setting before the turn goes out, so
+    // it holds for this turn and the ones after it.
+    let selection;
+    if (args.effort !== undefined) {
+      const config = await session.mcp.call("t3_thread_configuration", { threadId: row.id });
+      selection = config.modelSelection ?? {};
+      await assertEffort(session, selection.instanceId, selection.model, args.effort);
+    }
+    const intent = { threadId: row.id, ...(args.effort !== undefined ? { effort: args.effort } : {}) };
+    return decide(session, args, intent, async (decisionId) => {
+      if (selection !== undefined) {
+        const others = (selection.options ?? []).filter((o) => o.id !== "effort");
+        await session.mcp.call("t3_thread_configure", {
+          threadId: row.id,
+          modelSelection: { ...selection, options: [...others, { id: "effort", value: args.effort }] },
+        });
+      }
       const sent = await session.mcp.call("t3_thread_send", {
         threadId: row.id,
         message: args.task,
@@ -810,7 +863,12 @@ const VERBS = {
         clientRequestId: decisionId,
       });
       if (args.wait) return waitOutcome(session, row.id, sent.runId, timeoutMs);
-      return { threadId: row.id, started: true, url: await session.url(row.id) };
+      return {
+        threadId: row.id,
+        started: true,
+        effort: await threadEffort(session, row.id),
+        url: await session.url(row.id),
+      };
     });
   },
 
@@ -877,14 +935,15 @@ const VERBS = {
 };
 
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const all = [...Object.keys(LOCAL_VERBS), ...Object.keys(VERBS)];
-  if (args.help || args.verb === undefined || args.verb === "help") {
-    process.stdout.write(`t3-chair <${all.join("|")}> [--env <name>] [flags]\n`);
-    return;
-  }
-  if (!all.includes(args.verb)) usage(`unknown verb: ${args.verb}`);
   try {
+    const args = parseArgs(process.argv.slice(2));
+    const all = [...Object.keys(LOCAL_VERBS), ...Object.keys(VERBS)];
+    if (args.help || args.verb === undefined || args.verb === "help") {
+      process.stdout.write(`t3-chair <${all.join("|")}> [--env <name>] [flags]
+`);
+      return;
+    }
+    if (!all.includes(args.verb)) usage(`unknown verb: ${args.verb}`);
     // A brief is long and multi-line; a shell argument is a bad carrier for it.
     for (const name of ["task", "answer"]) {
       const file = args[`${name}-file`];
@@ -896,7 +955,7 @@ async function main() {
     console.error(`t3-chair: ${e?.message ?? String(e)}`);
     // exitCode, not exit(): on Windows, exiting while fetch's sockets are still
     // closing aborts Node (libuv UV_HANDLE_CLOSING) and loses the exit code.
-    process.exitCode = e instanceof ChairRefusal ? 3 : 1;
+    process.exitCode = e instanceof ChairUsage ? 2 : e instanceof ChairRefusal ? 3 : 1;
   }
 }
 
