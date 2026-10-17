@@ -37,7 +37,7 @@
  *   node bin/t3-chair.mjs read --thread <id> [--messages 6] [--chars 4000]
  *   node bin/t3-chair.mjs open --project <id|title> --title "<t>" --task "<brief>" --why "<reason>"
  *        [--account "<name>" | --instance <id>] [--model <id>] [--runtime <mode>] [--no-start]
- *        [--base <branch> | --in-place]
+ *        [--base <branch> | --in-place] [--effort <level>]
  *   node bin/t3-chair.mjs continue --thread <id> --task "<text>" --why "<reason>"
  *        [--wait] [--timeout-seconds 900]
  *   node bin/t3-chair.mjs answer --thread <id> --answer "<text>" --why "<reason>" [--request <id>]
@@ -102,6 +102,7 @@ const VALUE_FLAGS = new Set([
   "instance",
   "account",
   "base",
+  "effort",
   "model",
   "runtime",
   "answer",
@@ -274,6 +275,14 @@ async function openSession(args) {
         instanceId: p.providerInstanceId,
         models: p.models.map((m) => m.id),
       }));
+  /** The reasoning levels a model offers here (its `effort` option), or [] if it has none. */
+  const effortLevels = async (instanceId, model) => {
+    const provider = (await allProviders()).find((p) => p.providerInstanceId === instanceId);
+    const option = (provider?.models ?? [])
+      .find((m) => m.id === model)
+      ?.options?.find((o) => o.id === "effort");
+    return (option?.options ?? []).map((o) => o.id);
+  };
   const accountName = async (instanceId) =>
     (await allProviders()).find((p) => p.providerInstanceId === instanceId)?.displayName ??
     instanceId;
@@ -289,6 +298,7 @@ async function openSession(args) {
     url,
     accounts,
     accountName,
+    effortLevels,
   };
 }
 
@@ -713,6 +723,18 @@ const VERBS = {
     } else if (args.model !== undefined) {
       modelSelection = { model: args.model };
     }
+    // Without options a model runs at its own default effort, not the one the
+    // app's composer would pick; the app settings do not apply here.
+    if (args.effort !== undefined) {
+      if (modelSelection?.instanceId === undefined) usage("--effort needs --account (or --instance)");
+      const levels = await session.effortLevels(modelSelection.instanceId, modelSelection.model);
+      if (!levels.includes(args.effort)) {
+        usage(
+          `--effort for ${modelSelection.model} must be one of ${levels.join(", ") || "(none: this model has no effort setting)"}`,
+        );
+      }
+      modelSelection = { ...modelSelection, options: [{ id: "effort", value: args.effort }] };
+    }
     if (args["in-place"] && args.base !== undefined) usage("pass --base or --in-place, not both");
     const base = args.base ?? "main";
     const workspaceStrategy = args["in-place"]
@@ -768,6 +790,7 @@ const VERBS = {
         account: await session.accountName(instanceId),
         instanceId,
         model: body.thread?.model ?? "",
+        ...(args.effort !== undefined ? { effort: args.effort } : {}),
         workspace: args["in-place"] ? "in-place" : `worktree from origin/${base}`,
         started: !args["no-start"],
         url: await session.url(threadId),
