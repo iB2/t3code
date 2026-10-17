@@ -37,6 +37,7 @@
  *   node bin/t3-chair.mjs read --thread <id> [--messages 6] [--chars 4000]
  *   node bin/t3-chair.mjs open --project <id|title> --title "<t>" --task "<brief>" --why "<reason>"
  *        [--account "<name>" | --instance <id>] [--model <id>] [--runtime <mode>] [--no-start]
+ *        [--base <branch> | --in-place]
  *   node bin/t3-chair.mjs continue --thread <id> --task "<text>" --why "<reason>"
  *        [--wait] [--timeout-seconds 900]
  *   node bin/t3-chair.mjs answer --thread <id> --answer "<text>" --why "<reason>" [--request <id>]
@@ -46,6 +47,11 @@
  *   node bin/t3-chair.mjs log [--tail 20]
  *
  * Every verb that touches threads takes `--env <name>`.
+ *
+ * `open` gives each new thread its own worktree, branched from
+ * `origin/<base>` (default `main`), so threads in the same project can run side
+ * by side. `--in-place` runs it in the project folder instead, for work that
+ * needs what is only on that machine; such threads must run one at a time.
  *
  * Accounts are shown and chosen by display name (`account`, e.g. "Claude
  * Pessoal"): the instance id behind a name differs from machine to machine.
@@ -95,6 +101,7 @@ const VALUE_FLAGS = new Set([
   "why",
   "instance",
   "account",
+  "base",
   "model",
   "runtime",
   "answer",
@@ -107,7 +114,7 @@ const VALUE_FLAGS = new Set([
   "task-file",
   "answer-file",
 ]);
-const BOOL_FLAGS = new Set(["wait", "no-start", "no-browser", "help"]);
+const BOOL_FLAGS = new Set(["wait", "no-start", "no-browser", "in-place", "help"]);
 const RUNTIME_MODES = ["approval-required", "auto-accept-edits", "auto", "full-access"];
 
 function usage(message) {
@@ -503,6 +510,37 @@ async function waitOutcome(session, threadId, runId, timeoutMs) {
   };
 }
 
+/**
+ * Wait for T3 to finish preparing a new thread's worktree. Launching returns
+ * before the worktree exists, and a bad base branch only fails afterwards, so
+ * `open` checks here instead of reporting a thread that is already dead.
+ * Returns the failure text, or undefined once the worktree exists (or the
+ * preparation is still going at the deadline).
+ */
+async function workspaceFailure(session, threadId, timeoutMs = 90_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const { thread } = await session.mcp.call("t3_thread_read", {
+      threadId,
+      limit: 1,
+      maxCharsPerItem: 1,
+    });
+    if (thread?.worktreePath) return undefined;
+    if (thread?.status === "failed") {
+      const activity = await session.mcp.call("t3_thread_read", {
+        threadId,
+        view: "activity",
+        limit: 20,
+        maxCharsPerItem: 500,
+      });
+      const error = (activity.items ?? []).filter((i) => i.type === "error").pop();
+      return String(error?.text ?? "workspace preparation failed");
+    }
+    if (Date.now() >= deadline) return undefined;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+}
+
 // ── verbs ───────────────────────────────────────────────────────────────────
 
 /** Verbs that run before (or without) a signed-in session. */
@@ -675,12 +713,22 @@ const VERBS = {
     } else if (args.model !== undefined) {
       modelSelection = { model: args.model };
     }
-    const intent = { projectId: project.id, title: args.title };
+    if (args["in-place"] && args.base !== undefined) usage("pass --base or --in-place, not both");
+    const base = args.base ?? "main";
+    const workspaceStrategy = args["in-place"]
+      ? { type: "root" }
+      : { type: "worktree", baseRef: base, startFromOrigin: true };
+    const intent = {
+      projectId: project.id,
+      title: args.title,
+      workspace: args["in-place"] ? "in-place" : `worktree from origin/${base}`,
+    };
     return decide(session, args, intent, async () => {
       const launched = await session.mcp.call("t3_thread_launch", {
         title: args.title,
         projectId: project.id,
         runtimeMode,
+        workspaceStrategy,
         ...(args["no-start"] ? {} : { message: args.task }),
         ...(modelSelection ? { modelSelection } : {}),
       });
@@ -706,11 +754,21 @@ const VERBS = {
           `refused: the new thread landed on instance '${instanceId}', outside the chair policy; it was stopped and archived`,
         );
       }
+      if (!args["in-place"] && !args["no-start"]) {
+        const failure = await workspaceFailure(session, threadId);
+        if (failure !== undefined) {
+          await session.mcp.call("t3_thread_organize", { action: "archive", threadId });
+          throw new Error(
+            `${failure}; the thread was archived. Check --base: it must be a branch on origin (usually main or master)`,
+          );
+        }
+      }
       return {
         threadId,
         account: await session.accountName(instanceId),
         instanceId,
         model: body.thread?.model ?? "",
+        workspace: args["in-place"] ? "in-place" : `worktree from origin/${base}`,
         started: !args["no-start"],
         url: await session.url(threadId),
       };
