@@ -275,7 +275,7 @@ export function classifyMcpThread(thread: Row, pendingInput?: PendingUserInput):
   }
 }
 
-const TERMINAL_RUN = ["completed", "failed", "interrupted", "cancelled", "rolled_back"];
+const TERMINAL_RUN = new Set(["completed", "failed", "interrupted", "cancelled", "rolled_back"]);
 
 /** No run is active and an earlier run already ran to an end: the queue is held. */
 function heldQueue(thread: Row): boolean {
@@ -284,8 +284,7 @@ function heldQueue(thread: Row): boolean {
     ? (thread["recentRuns"] as ReadonlyArray<Row>)
     : [];
   return runs.some(
-    (run) =>
-      (run["startedAt"] ?? null) !== null && TERMINAL_RUN.includes(String(run["status"] ?? "")),
+    (run) => (run["startedAt"] ?? null) !== null && TERMINAL_RUN.has(String(run["status"] ?? "")),
   );
 }
 
