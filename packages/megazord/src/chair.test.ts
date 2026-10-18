@@ -8,6 +8,7 @@ import {
   parsePolicy,
   pendingApprovals,
   projectVisible,
+  settleRefusal,
   threadVisible,
 } from "./chair.ts";
 
@@ -156,5 +157,61 @@ describe("classifyMcpThread", () => {
     expect(classifyMcpThread(row({ status: "failed" })).status).toBe("error");
     expect(classifyMcpThread(row({ status: "cancelled" })).status).toBe("interrupted");
     expect(classifyMcpThread(row({ status: "queued" })).status).toBe("running");
+  });
+});
+
+describe("a queue held after the last turn ended", () => {
+  // The shape T3 0.1.0 returned on 2026-10-18 for a thread whose turn died on a
+  // session limit while a follow-up sat in the queue: t3_thread_read reports the
+  // queued run as the thread's status, nothing is active, and the queued run never
+  // started. T3 refuses to settle it ("has a queued message").
+  const held = {
+    threadId: "t1",
+    status: "queued",
+    latestRunId: "run:2",
+    activeRunId: null,
+    pendingRequestCount: 0,
+    runCount: 2,
+    itemCount: 228,
+    settled: false,
+    recentRuns: [
+      { runId: "run:2", ordinal: 2, status: "queued", startedAt: null, completedAt: null },
+      {
+        runId: "run:1",
+        ordinal: 1,
+        status: "failed",
+        startedAt: "2026-10-18T15:40:11.413Z",
+        completedAt: "2026-10-18T16:56:17.762Z",
+      },
+    ],
+  };
+
+  it("is a held queue, not a running turn", () => {
+    expect(classifyMcpThread(held).status).toBe("queued");
+  });
+
+  it("refuses settle naming the queue, unless the caller drops it", () => {
+    const state = classifyMcpThread(held);
+    expect(settleRefusal(state, { queuedCount: 1 })).toMatch(/1 queued message .*--drop-queued/);
+    expect(settleRefusal(state, { queuedCount: 1, dropQueued: true })).toBe(undefined);
+  });
+
+  it("still refuses a thread with a turn running, even with --drop-queued", () => {
+    const running = {
+      ...held,
+      status: "running",
+      activeRunId: "run:2",
+      recentRuns: [{ ...held.recentRuns[0], status: "running", startedAt: "2026-10-18T17:00:00Z" }],
+    };
+    expect(classifyMcpThread(running).status).toBe("running");
+    expect(settleRefusal(classifyMcpThread(running), { dropQueued: true })).toMatch(/running/);
+    expect(settleRefusal(classifyMcpThread({ ...held, status: "failed", recentRuns: [] }))).toBe(
+      undefined,
+    );
+  });
+
+  it("keeps a new thread whose first run is still queued as running", () => {
+    const fresh = { ...held, latestRunId: "run:1", runCount: 1, recentRuns: [held.recentRuns[0]] };
+    expect(classifyMcpThread(fresh).status).toBe("running");
   });
 });

@@ -155,10 +155,14 @@ export function pendingApprovals(
  *    "should I go on?" ending lands.
  *  - `done`: the thread was settled.
  *  - `empty`: no turn ever ran.
+ *  - `queued`: no turn is running, but messages sit in a queue that T3 holds
+ *    after the last turn ended (a stop, a failure, a session limit). T3 will
+ *    not settle the thread until they are sent or dropped.
  */
 export type ChairStatus =
   | "question"
   | "approval"
+  | "queued"
   | "running"
   | "error"
   | "interrupted"
@@ -170,6 +174,7 @@ export type ChairStatus =
 export const NEEDS_DECISION: ReadonlyArray<ChairStatus> = [
   "question",
   "approval",
+  "queued",
   "error",
   "interrupted",
   "idle",
@@ -221,6 +226,13 @@ export function classifyThread(thread: Row, activities: ReadonlyArray<Row>): Cha
  * a pending question (pass it as `pendingInput`) the thread is a `question`;
  * with requests but no question it is a permission approval, which the MCP can
  * neither answer nor describe, so that case only flags it.
+ *
+ * `t3_thread_read` reports a thread whose last turn ended while a follow-up
+ * waited in the queue as `queued`, with no active run: the queued run never
+ * starts on its own. That is a held queue, not a turn in flight. A brand-new
+ * thread whose first run is still queued has no earlier run and stays
+ * `running`. (`t3_thread_list` ignores the queued run and reports the last run
+ * that ran, so the two views disagree; this one is what settle checks.)
  */
 export function classifyMcpThread(thread: Row, pendingInput?: PendingUserInput): ChairThreadState {
   const turnId = String(thread["latestRunId"] ?? "");
@@ -233,6 +245,7 @@ export function classifyMcpThread(thread: Row, pendingInput?: PendingUserInput):
     case "running":
     case "waiting":
       if (pendingInput !== undefined) return { status: "question", turnId, pendingInput };
+      if (status === "queued" && heldQueue(thread)) return { status: "queued", turnId };
       if (status !== "waiting" && Number(thread["pendingRequestCount"] ?? 0) === 0) {
         return { status: "running", turnId };
       }
@@ -259,5 +272,46 @@ export function classifyMcpThread(thread: Row, pendingInput?: PendingUserInput):
       return Number(thread["itemCount"] ?? 0) > 0 || turnId !== ""
         ? { status: "idle", turnId }
         : { status: "empty", turnId };
+  }
+}
+
+const TERMINAL_RUN = new Set(["completed", "failed", "interrupted", "cancelled", "rolled_back"]);
+
+/** No run is active and an earlier run already ran to an end: the queue is held. */
+function heldQueue(thread: Row): boolean {
+  if ((thread["activeRunId"] ?? null) !== null) return false;
+  const runs = Array.isArray(thread["recentRuns"])
+    ? (thread["recentRuns"] as ReadonlyArray<Row>)
+    : [];
+  return runs.some(
+    (run) => (run["startedAt"] ?? null) !== null && TERMINAL_RUN.has(String(run["status"] ?? "")),
+  );
+}
+
+/**
+ * Why `settle` must refuse a thread in this state, or undefined when it may go
+ * ahead. A held queue is refused unless the caller asked to drop it: T3 itself
+ * refuses to settle a thread with a queued message, and dropping one throws
+ * away an instruction, so it is never done silently.
+ */
+export function settleRefusal(
+  state: ChairThreadState,
+  options: { readonly dropQueued?: boolean; readonly queuedCount?: number } = {},
+): string | undefined {
+  switch (state.status) {
+    case "running":
+      return "is running, not finished";
+    case "question":
+      return "is waiting on a question; answer it first";
+    case "approval":
+      return "is waiting on an approval; answer it in the T3 app first";
+    case "queued": {
+      if (options.dropQueued === true) return undefined;
+      const n = options.queuedCount;
+      const what = n === undefined ? "queued messages" : `${n} queued message${n === 1 ? "" : "s"}`;
+      return `has ${what} held after its last turn ended and no turn running (stalled queue); T3 settles it only once they are sent or dropped: pass --drop-queued to drop them and settle`;
+    }
+    default:
+      return undefined;
   }
 }
