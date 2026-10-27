@@ -1,7 +1,7 @@
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import * as nodePath from "node:path";
-import { tmpdir } from "node:os";
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
@@ -61,10 +61,10 @@ function fakeSession(baseDir: string, queue: ReadonlyArray<Queued>) {
       completedAt: "2026-10-18T16:56:17.762Z",
     },
   ].toReversed();
-  const dropped = nodePath.join(baseDir, "chair", "dropped");
+  const dropped = NodePath.join(baseDir, "chair", "dropped");
   const mcp = {
     async call(tool: string, args: Record<string, unknown> = {}) {
-      calls.push({ tool, args, filesThen: existsSync(dropped) });
+      calls.push({ tool, args, filesThen: NodeFS.existsSync(dropped) });
       switch (tool) {
         case "t3_thread_read":
           return { thread, recentRuns, items: [], nextPosition: null, hasMore: false };
@@ -106,11 +106,11 @@ const LONG = `${"Revise o PR e rode a suíte inteira. ".repeat(83)}\nÚLTIMA LIN
 let baseDir: string;
 
 afterEach(async () => {
-  if (baseDir !== undefined) await rm(baseDir, { recursive: true, force: true });
+  if (baseDir !== undefined) await NodeFSP.rm(baseDir, { recursive: true, force: true });
 });
 
 async function freshBaseDir() {
-  baseDir = await mkdtemp(nodePath.join(tmpdir(), "t3-chair-test-"));
+  baseDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-chair-test-"));
   return baseDir;
 }
 
@@ -129,8 +129,8 @@ describe("settle --drop-queued", () => {
 
     const out = await VERBS.settle(session, { ...settleArgs });
 
-    const file = nodePath.join(baseDir, "chair", "dropped", "thread-1", "run_2.md");
-    const saved = await readFile(file, "utf8");
+    const file = NodePath.join(baseDir, "chair", "dropped", "thread-1", "run_2.md");
+    const saved = await NodeFSP.readFile(file, "utf8");
     expect(saved).toContain(LONG);
     expect(saved).toContain("ÚLTIMA LINHA: não faça merge.");
     expect(saved).toContain("thread-1");
@@ -145,7 +145,7 @@ describe("settle --drop-queued", () => {
     expect(out.settled).toBe(true);
     expect(out.droppedQueued).toEqual([{ queuedRunId: "run:2", file }]);
 
-    const log = (await readFile(nodePath.join(baseDir, "chair", "decisions.jsonl"), "utf8"))
+    const log = (await NodeFSP.readFile(NodePath.join(baseDir, "chair", "decisions.jsonl"), "utf8"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));
@@ -165,8 +165,8 @@ describe("settle --drop-queued", () => {
       { queuedRunId: "run:2", text: LONG, requestedAt: "2026-10-18T16:50:02.000Z" },
     ]);
     // A file where the folder must go: the save fails.
-    await mkdir(nodePath.join(baseDir, "chair"), { recursive: true });
-    await writeFile(nodePath.join(baseDir, "chair", "dropped"), "not a folder", "utf8");
+    await NodeFSP.mkdir(NodePath.join(baseDir, "chair"), { recursive: true });
+    await NodeFSP.writeFile(NodePath.join(baseDir, "chair", "dropped"), "not a folder", "utf8");
 
     await expect(VERBS.settle(session, { ...settleArgs })).rejects.toThrow(ChairRefusal);
     await expect(VERBS.settle(session, { ...settleArgs })).rejects.toThrow(/could not save/);
@@ -222,6 +222,6 @@ describe("queue", () => {
     ]);
     expect(out.items[0].text.length).toBeGreaterThan(200);
     expect(writes(calls)).toEqual([]);
-    expect(existsSync(nodePath.join(baseDir, "chair"))).toBe(false);
+    expect(NodeFS.existsSync(NodePath.join(baseDir, "chair"))).toBe(false);
   });
 });
