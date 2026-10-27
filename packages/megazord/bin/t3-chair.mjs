@@ -42,7 +42,7 @@
  *        [--wait] [--timeout-seconds 900] [--effort <level>]
  *   node bin/t3-chair.mjs answer --thread <id> --answer "<text>" --why "<reason>" [--request <id>]
  *   node bin/t3-chair.mjs interrupt --thread <id> --why "<reason>"
- *   node bin/t3-chair.mjs settle --thread <id> --why "<reason>"
+ *   node bin/t3-chair.mjs settle --thread <id> --why "<reason>" [--drop-queued]
  *   node bin/t3-chair.mjs wait --thread <id> [--timeout-seconds 900]
  *   node bin/t3-chair.mjs log [--tail 20]
  *
@@ -78,6 +78,7 @@ import {
   NEEDS_DECISION,
   assertInstanceAllowed,
   classifyMcpThread,
+  settleRefusal,
   parsePolicy,
   projectVisible,
   threadVisible,
@@ -120,7 +121,7 @@ const VALUE_FLAGS = new Set([
   "task-file",
   "answer-file",
 ]);
-const BOOL_FLAGS = new Set(["wait", "no-start", "no-browser", "in-place", "help"]);
+const BOOL_FLAGS = new Set(["wait", "no-start", "no-browser", "in-place", "drop-queued", "help"]);
 const RUNTIME_MODES = ["approval-required", "auto-accept-edits", "auto", "full-access"];
 
 /** A malformed command (exit 2). Thrown, never exit()ed: see main. */
@@ -253,7 +254,7 @@ async function openSession(args) {
       }
       throw e;
     }
-    const row = rowOf(body.thread ?? {});
+    const row = rowOf({ ...body.thread, recentRuns: body.recentRuns ?? [] });
     if (!visibleProjectIds.has(row.projectId) || !threadVisible(policy, row)) {
       throw new ChairRefusal(`refused: no thread '${wanted}' within the chair policy`);
     }
@@ -346,6 +347,17 @@ async function pendingQuestion(session, threadId, requestId) {
   return questionOf(await session.mcp.call("t3_pending_request_read", { threadId, requestId: id }));
 }
 
+/** The messages waiting in a thread's queue, in delivery order. */
+async function queuedMessages(session, threadId) {
+  const items = [];
+  for (let cursor = 0; cursor !== null && cursor !== undefined;) {
+    const page = await session.mcp.call("t3_queue_list", { threadId, cursor, limit: 100 });
+    items.push(...(page.items ?? []));
+    cursor = page.nextCursor;
+  }
+  return items;
+}
+
 const ACTIVE = new Set(["preparing", "queued", "starting", "running", "waiting"]);
 
 /**
@@ -361,7 +373,7 @@ async function stateOf(session, row) {
       limit: 1,
       maxCharsPerItem: 1,
     });
-    thread = { ...thread, ...body.thread };
+    thread = { ...thread, ...body.thread, recentRuns: body.recentRuns ?? [] };
   }
   const pending =
     ACTIVE.has(thread.status) && Number(thread.pendingRequestCount ?? 0) > 0
@@ -762,7 +774,8 @@ const VERBS = {
     // project default alone.
     let effort;
     if (args.effort !== undefined) {
-      if (modelSelection?.instanceId === undefined) usage("--effort needs --account (or --instance)");
+      if (modelSelection?.instanceId === undefined)
+        usage("--effort needs --account (or --instance)");
       await assertEffort(session, modelSelection.instanceId, modelSelection.model, args.effort);
       effort = args.effort;
     } else if (modelSelection?.instanceId !== undefined) {
@@ -847,13 +860,19 @@ const VERBS = {
       selection = config.modelSelection ?? {};
       await assertEffort(session, selection.instanceId, selection.model, args.effort);
     }
-    const intent = { threadId: row.id, ...(args.effort !== undefined ? { effort: args.effort } : {}) };
+    const intent = {
+      threadId: row.id,
+      ...(args.effort !== undefined ? { effort: args.effort } : {}),
+    };
     return decide(session, args, intent, async (decisionId) => {
       if (selection !== undefined) {
         const others = (selection.options ?? []).filter((o) => o.id !== "effort");
         await session.mcp.call("t3_thread_configure", {
           threadId: row.id,
-          modelSelection: { ...selection, options: [...others, { id: "effort", value: args.effort }] },
+          modelSelection: {
+            ...selection,
+            options: [...others, { id: "effort", value: args.effort }],
+          },
         });
       }
       const sent = await session.mcp.call("t3_thread_send", {
@@ -914,16 +933,31 @@ const VERBS = {
   },
 
   /** Close a thread whose work is finished, so it leaves the inbox. */
+  /**
+   * Close a thread whose work is finished, so it leaves the inbox. A queue held
+   * after the last turn ended blocks it (T3 refuses too); `--drop-queued`
+   * cancels those messages first, logging each one before it goes.
+   */
   async settle(session, args) {
     need(args, "thread");
     const row = await session.getThread(args.thread);
     const state = await stateOf(session, row);
-    if (["running", "question", "approval"].includes(state.status)) {
-      throw new ChairRefusal(`refused: thread '${row.id}' is ${state.status}, not finished`);
-    }
-    return decide(session, args, { threadId: row.id }, async () => {
+    const queued = state.status === "queued" ? await queuedMessages(session, row.id) : [];
+    const dropQueued = args["drop-queued"] === true;
+    const refusal = settleRefusal(state, { dropQueued, queuedCount: queued.length });
+    if (refusal !== undefined) throw new ChairRefusal(`refused: thread '${row.id}' ${refusal}`);
+    const dropped = queued.map((q) => ({ queuedRunId: q.queuedRunId, text: clip(q.text, 200) }));
+    const intent = { threadId: row.id, ...(dropped.length > 0 ? { droppedQueued: dropped } : {}) };
+    return decide(session, args, intent, async () => {
+      for (const q of dropped) {
+        await session.mcp.call("t3_queue_cancel", { threadId: row.id, queuedRunId: q.queuedRunId });
+      }
       await session.mcp.call("t3_thread_organize", { action: "settle", threadId: row.id });
-      return { threadId: row.id, settled: true };
+      return {
+        threadId: row.id,
+        settled: true,
+        ...(dropped.length > 0 ? { droppedQueued: dropped.map((q) => q.queuedRunId) } : {}),
+      };
     });
   },
 
