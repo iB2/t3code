@@ -70,8 +70,10 @@
  * @module megazord/bin/t3-chair
  */
 import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import * as nodePath from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   ChairRefusal,
@@ -993,4 +995,17 @@ async function main() {
   }
 }
 
-await main();
+// Guarded so the tests can import the verbs without running a command; the
+// path is resolved like the loader resolves it, so a symlinked bin still runs.
+function isMain() {
+  if (process.argv[1] === undefined) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isMain()) await main();
+
+export { VERBS };
