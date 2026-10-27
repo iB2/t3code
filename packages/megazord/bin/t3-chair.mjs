@@ -42,6 +42,7 @@
  *        [--wait] [--timeout-seconds 900] [--effort <level>]
  *   node bin/t3-chair.mjs answer --thread <id> --answer "<text>" --why "<reason>" [--request <id>]
  *   node bin/t3-chair.mjs interrupt --thread <id> --why "<reason>"
+ *   node bin/t3-chair.mjs queue --thread <id>
  *   node bin/t3-chair.mjs settle --thread <id> --why "<reason>" [--drop-queued]
  *   node bin/t3-chair.mjs wait --thread <id> [--timeout-seconds 900]
  *   node bin/t3-chair.mjs log [--tail 20]
@@ -61,6 +62,12 @@
  * Accounts are shown and chosen by display name (`account`, e.g. "Claude
  * Pessoal"): the instance id behind a name differs from machine to machine.
  *
+ * `queue` lists the messages waiting in a thread's queue, each with its whole
+ * text. `settle --drop-queued` saves every one of them to
+ * `<base-dir>/chair/dropped/<thread>/<queued run>.md` before cancelling it, and
+ * refuses, cancelling nothing, when a text comes back empty or cut or cannot be
+ * saved.
+ *
  * `approve` is kept as a verb but always refuses: T3's MCP cannot answer
  * permission approvals, so they are answered in the T3 app.
  *
@@ -69,9 +76,11 @@
  *
  * @module megazord/bin/t3-chair
  */
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import * as NodeFS from "node:fs";
 import { randomUUID } from "node:crypto";
 import * as nodePath from "node:path";
+import * as NodeURL from "node:url";
 
 import {
   ChairRefusal,
@@ -347,15 +356,102 @@ async function pendingQuestion(session, threadId, requestId) {
   return questionOf(await session.mcp.call("t3_pending_request_read", { threadId, requestId: id }));
 }
 
-/** The messages waiting in a thread's queue, in delivery order. */
+/**
+ * The messages waiting in a thread's queue, in delivery order, each with its
+ * whole text. `t3_queue_list` cuts a message at 1,000 characters, so a cut one
+ * is read again with `t3_queue_read`, which returns up to 16,000; `complete` is
+ * false when even that was cut. The date is the queued run's `requestedAt`,
+ * which only `t3_thread_read` carries.
+ */
 async function queuedMessages(session, threadId) {
-  const items = [];
+  const listed = [];
   for (let cursor = 0; cursor !== null && cursor !== undefined;) {
     const page = await session.mcp.call("t3_queue_list", { threadId, cursor, limit: 100 });
-    items.push(...(page.items ?? []));
+    listed.push(...(page.items ?? []));
     cursor = page.nextCursor;
   }
-  return items;
+  if (listed.length === 0) return [];
+  const { recentRuns } = await session.mcp.call("t3_thread_read", {
+    threadId,
+    limit: 1,
+    maxCharsPerItem: 1,
+    runLimit: 50,
+  });
+  const requestedAt = new Map((recentRuns ?? []).map((r) => [r.runId, r.requestedAt]));
+  const out = [];
+  for (const q of listed) {
+    const whole =
+      q.truncated === false
+        ? q
+        : await session.mcp.call("t3_queue_read", { threadId, queuedRunId: q.queuedRunId });
+    const text = String(whole.text ?? "");
+    out.push({
+      queuedRunId: q.queuedRunId,
+      queuedAt: requestedAt.get(q.queuedRunId) ?? null,
+      chars: Array.from(text).length,
+      complete: whole.truncated === false,
+      text,
+    });
+  }
+  return out;
+}
+
+/** An id as a file name: T3 run ids hold `:`, which Windows refuses. */
+function fileSafe(id) {
+  const name = String(id).replace(/[^A-Za-z0-9._-]/g, "_");
+  return /^\.*$/.test(name) ? `_${name}` : name;
+}
+
+/**
+ * Keep the whole text of each queued message on disk before settle cancels it,
+ * in `<base-dir>/chair/dropped/<thread>/<queued run>.md`: a dropped message is
+ * an instruction that never ran, and once cancelled T3 no longer lists it. A
+ * text that came back empty or cut, or a file that cannot be written and read
+ * back, is a refusal, and nothing is cancelled.
+ */
+async function saveDropped(session, args, threadId, queued) {
+  for (const q of queued) {
+    const which = `queued message ${q.queuedRunId} on thread '${threadId}'`;
+    if (q.text.trim() === "") {
+      throw new ChairRefusal(`refused: ${which} came back empty; nothing was cancelled`);
+    }
+    if (!q.complete) {
+      throw new ChairRefusal(
+        `refused: ${which} came back truncated at ${q.chars} characters (T3 reads up to 16,000); nothing was cancelled. Copy it and cancel it in the T3 app`,
+      );
+    }
+  }
+  const dir = nodePath.join(session.baseDir, "chair", "dropped", fileSafe(threadId));
+  const saved = [];
+  for (const q of queued) {
+    const file = nodePath.join(dir, `${fileSafe(q.queuedRunId)}.md`);
+    const body = [
+      "# Queued message dropped by t3-chair settle",
+      "",
+      `- environment: ${session.env.name}`,
+      `- threadId: ${threadId}`,
+      `- queuedRunId: ${q.queuedRunId}`,
+      `- queuedAt: ${q.queuedAt ?? "unknown"}`,
+      `- droppedAt: ${new Date().toISOString()}`,
+      `- characters: ${q.chars}`,
+      `- why: ${String(args.why).replace(/\s+/g, " ").trim()}`,
+      "",
+      "---",
+      "",
+      q.text.endsWith("\n") ? q.text : `${q.text}\n`,
+    ].join("\n");
+    try {
+      await mkdir(dir, { recursive: true });
+      await writeFile(file, body, { encoding: "utf8", flush: true });
+      if ((await readFile(file, "utf8")) !== body) throw new Error("the file read back differs");
+    } catch (e) {
+      throw new ChairRefusal(
+        `refused: could not save queued message ${q.queuedRunId} to ${file} (${e?.message ?? e}); nothing was cancelled`,
+      );
+    }
+    saved.push({ ...q, file });
+  }
+  return saved;
 }
 
 const ACTIVE = new Set(["preparing", "queued", "starting", "running", "waiting"]);
@@ -932,11 +1028,25 @@ const VERBS = {
     });
   },
 
-  /** Close a thread whose work is finished, so it leaves the inbox. */
+  /** The messages waiting in a thread's queue, each with its date and whole text. */
+  async queue(session, args) {
+    need(args, "thread");
+    const row = await session.getThread(args.thread);
+    const items = await queuedMessages(session, row.id);
+    return {
+      environment: session.env.name,
+      threadId: row.id,
+      count: items.length,
+      items,
+      url: await session.url(row.id),
+    };
+  },
+
   /**
    * Close a thread whose work is finished, so it leaves the inbox. A queue held
    * after the last turn ended blocks it (T3 refuses too); `--drop-queued`
-   * cancels those messages first, logging each one before it goes.
+   * cancels those messages first, each saved whole to a file and logged before
+   * it goes.
    */
   async settle(session, args) {
     need(args, "thread");
@@ -946,8 +1056,15 @@ const VERBS = {
     const dropQueued = args["drop-queued"] === true;
     const refusal = settleRefusal(state, { dropQueued, queuedCount: queued.length });
     if (refusal !== undefined) throw new ChairRefusal(`refused: thread '${row.id}' ${refusal}`);
-    const dropped = queued.map((q) => ({ queuedRunId: q.queuedRunId, text: clip(q.text, 200) }));
-    const intent = { threadId: row.id, ...(dropped.length > 0 ? { droppedQueued: dropped } : {}) };
+    const dropped = await saveDropped(session, args, row.id, queued);
+    const droppedQueued = dropped.map((q) => ({
+      queuedRunId: q.queuedRunId,
+      queuedAt: q.queuedAt,
+      chars: q.chars,
+      file: q.file,
+      preview: clip(q.text, 200),
+    }));
+    const intent = { threadId: row.id, ...(dropped.length > 0 ? { droppedQueued } : {}) };
     return decide(session, args, intent, async () => {
       for (const q of dropped) {
         await session.mcp.call("t3_queue_cancel", { threadId: row.id, queuedRunId: q.queuedRunId });
@@ -956,7 +1073,9 @@ const VERBS = {
       return {
         threadId: row.id,
         settled: true,
-        ...(dropped.length > 0 ? { droppedQueued: dropped.map((q) => q.queuedRunId) } : {}),
+        ...(dropped.length > 0
+          ? { droppedQueued: dropped.map((q) => ({ queuedRunId: q.queuedRunId, file: q.file })) }
+          : {}),
       };
     });
   },
@@ -993,4 +1112,17 @@ async function main() {
   }
 }
 
-await main();
+// Guarded so the tests can import the verbs without running a command; the
+// path is resolved like the loader resolves it, so a symlinked bin still runs.
+function isMain() {
+  if (process.argv[1] === undefined) return false;
+  try {
+    return import.meta.url === NodeURL.pathToFileURL(NodeFS.realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isMain()) await main();
+
+export { VERBS };
