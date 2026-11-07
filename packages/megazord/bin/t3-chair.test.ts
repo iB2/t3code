@@ -465,6 +465,22 @@ describe("read", () => {
     expect(page?.args["afterPosition"]).toBeUndefined();
   });
 
+  it("counts a server truncation marker inside the chair clip (known baseline)", async () => {
+    const { session } = readSession({
+      items: [
+        serverItem({
+          text: "abc",
+          textTruncated: true,
+          nextTextOffset: 3,
+        }),
+      ],
+    });
+    const out = await VERBS.read(session, { verb: "read", thread: "thread-1", chars: "3" });
+    expect(out.messages).toEqual([
+      { role: "user", at: "2026-11-01T00:00:00.000Z", text: "abc… [+13 chars]" },
+    ]);
+  });
+
   it("still clips a long legacy message", async () => {
     const { session } = readSession({
       items: [serverItem({ text: "abcdef", textTruncated: false, nextTextOffset: null })],
@@ -687,6 +703,7 @@ describe("read", () => {
       pieces: piecesFromDetail(first),
       hasMore: first.hasMore,
       mode: "snapshot",
+      view: first.view,
     });
     const reread = reconcileTimeline({
       previous: opened.records,
@@ -695,6 +712,7 @@ describe("read", () => {
       pieces: piecesFromDetail(second),
       hasMore: second.hasMore,
       mode: "snapshot",
+      view: second.view,
     });
 
     expect(reread.removed.map((entry) => entry.item.itemId)).toEqual(["item-a"]);

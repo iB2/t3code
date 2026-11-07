@@ -880,6 +880,10 @@ const VERBS = {
       const messages = (
         await lastMessages(session, row.id, count, chars, Number(row.mcp.itemCount ?? 0))
       ).map((m) => ({ ...m, text: clip(m.text, chars) }));
+      // Known baseline, not a complete truncation report. A server-cut item is
+      // marked `… [truncated]` and then clipped to `--chars`. When that marked
+      // string is longer than `--chars`, the marker is cut off and `+N chars`
+      // counts the marker, not the unread remainder still on the server.
       return { ...summary, messages };
     }
     const page = await session.mcp.call("t3_thread_read", { ...pageRequest, threadId: row.id });

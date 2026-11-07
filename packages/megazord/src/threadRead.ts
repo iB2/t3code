@@ -18,6 +18,14 @@
 
 export type TimelineView = "messages" | "activity";
 
+/** Types T3 keeps in a `messages` page. Other timeline rows are activity-only. */
+const MESSAGE_TYPES = new Set(["user_message", "assistant_message", "proposed_plan"]);
+
+function inSnapshotScope(view: TimelineView, item: ChairDetailItem): boolean {
+  if (view === "activity") return true;
+  return item.type !== null && MESSAGE_TYPES.has(item.type);
+}
+
 /** One server timeline item, with the fields a later reread has to match. */
 export interface ChairDetailItem {
   readonly position: number | null;
@@ -274,11 +282,12 @@ function mergeFragment(
     }
     return piece.item;
   }
-  if (
-    stored.updatedAt !== null &&
-    piece.item.updatedAt !== null &&
-    stored.updatedAt !== piece.item.updatedAt
-  ) {
+  if (stored.updatedAt === null || piece.item.updatedAt === null) {
+    throw new TimelineReadError(
+      "refused: updatedAt is required to continue a stored timeline item",
+    );
+  }
+  if (stored.updatedAt !== piece.item.updatedAt) {
     throw new TimelineReadError(
       "refused: the item changed during continuation; reread it as a full item",
     );
@@ -293,7 +302,13 @@ function mergeFragment(
   if (overlap !== text.slice(0, overlap.length)) {
     throw new TimelineReadError("refused: a text fragment does not match the text already kept");
   }
-  if (piece.textOffset + text.length < have.length) return stored;
+  const end = piece.textOffset + text.length;
+  if (end < have.length) return stored;
+  // A duplicate slice that stops at the stored end must not mark a finished
+  // item truncated again.
+  if (end === have.length && stored.textTruncated === false && piece.item.textTruncated) {
+    return stored;
+  }
   const assembled = have.slice(0, piece.textOffset) + text;
   return {
     ...stored,
@@ -305,24 +320,58 @@ function mergeFragment(
 }
 
 /**
+ * Keep the assembled text and its truncation fields. Copy metadata the new
+ * read actually carries, including a moved `position`.
+ */
+function retainAssembledText(stored: ChairDetailItem, incoming: ChairDetailItem): ChairDetailItem {
+  const subagentId = incoming.subagentId ?? stored.subagentId;
+  const senderThreadId = incoming.senderThreadId ?? stored.senderThreadId;
+  return {
+    ...stored,
+    position: incoming.position ?? stored.position,
+    visibility: incoming.visibility ?? stored.visibility,
+    status: incoming.status ?? stored.status,
+    title: incoming.title ?? stored.title,
+    runId: incoming.runId ?? stored.runId,
+    messageId: incoming.messageId ?? stored.messageId,
+    createdBy: incoming.createdBy ?? stored.createdBy,
+    creationSource: incoming.creationSource ?? stored.creationSource,
+    type: incoming.type ?? stored.type,
+    ...(subagentId === undefined ? {} : { subagentId }),
+    ...(senderThreadId === undefined ? {} : { senderThreadId }),
+    text: stored.text,
+    textTruncated: stored.textTruncated,
+    nextTextOffset: stored.nextTextOffset,
+    updatedAt: stored.updatedAt,
+  };
+}
+
+/**
  * A same-version full item must not replace a longer stored text with a
  * matching truncated prefix. A different `updatedAt` replaces the record.
- * Same-version text that is not a prefix either way is refused.
+ * v0.1.7 always sends `updatedAt`. A null timestamp is an invalid payload, so
+ * it cannot replace stored text. Same-version text that is not a prefix either
+ * way is refused.
  */
 function applyFullItem(
   stored: ChairDetailItem | undefined,
   incoming: ChairDetailItem,
 ): ChairDetailItem {
-  if (stored === undefined || stored.text === null || incoming.text === null) return incoming;
-  const sameVersion =
-    stored.updatedAt !== null &&
-    incoming.updatedAt !== null &&
-    stored.updatedAt === incoming.updatedAt;
-  if (!sameVersion) return incoming;
-  if (incoming.text === stored.text) {
-    return stored.textTruncated === false && incoming.textTruncated ? stored : incoming;
+  if (stored === undefined || stored.text === null) return incoming;
+  if (incoming.text === null || stored.updatedAt === null || incoming.updatedAt === null) {
+    throw new TimelineReadError(
+      "refused: updatedAt and text are required to compare a timeline item with stored text",
+    );
   }
-  if (stored.text.startsWith(incoming.text) && incoming.textTruncated) return stored;
+  if (stored.updatedAt !== incoming.updatedAt) return incoming;
+  if (incoming.text === stored.text) {
+    return stored.textTruncated === false && incoming.textTruncated
+      ? retainAssembledText(stored, incoming)
+      : incoming;
+  }
+  if (stored.text.startsWith(incoming.text) && incoming.textTruncated) {
+    return retainAssembledText(stored, incoming);
+  }
   if (incoming.text.startsWith(stored.text)) return incoming;
   throw new TimelineReadError(
     "refused: a full item of the same version contradicts the text already kept",
@@ -339,20 +388,22 @@ function applyFullItem(
  * `previous` is left untouched.
  *
  * `page` updates and inserts. It does not remove, because a short page is not
- * evidence that an unseen item is gone. `snapshot` is a full reread of full
- * items (`hasMore` false) and replaces that thread's records. A fragment
- * cannot remove items. There is no promise that the pages were a consistent
- * server snapshot: an item skipped because the timeline moved is reported
- * removed.
+ * evidence that an unseen item is gone. `snapshot` is a full reread of one
+ * view (`hasMore` false). `messages` removes only user, assistant, and plan
+ * items that the reread left out. `activity` removes any item of that thread
+ * the reread left out. A fragment cannot remove items. There is no promise
+ * that the pages were a consistent server snapshot: an item skipped because
+ * the timeline moved is reported removed.
  */
-export function reconcileTimeline(input: {
-  readonly previous: ReadonlyArray<TimelineRecord>;
-  readonly endpoint: string;
-  readonly threadId: string;
-  readonly pieces: ReadonlyArray<TimelinePiece>;
-  readonly hasMore: boolean;
-  readonly mode: "page" | "snapshot";
-}): ReconcileOutcome {
+export function reconcileTimeline(
+  input: {
+    readonly previous: ReadonlyArray<TimelineRecord>;
+    readonly endpoint: string;
+    readonly threadId: string;
+    readonly pieces: ReadonlyArray<TimelinePiece>;
+    readonly hasMore: boolean;
+  } & ({ readonly mode: "page" } | { readonly mode: "snapshot"; readonly view: TimelineView }),
+): ReconcileOutcome {
   if (input.mode === "snapshot" && input.hasMore) {
     throw new TimelineReadError(
       "refused: a page with hasMore is not a full reread, so it cannot remove items",
@@ -360,6 +411,17 @@ export function reconcileTimeline(input: {
   }
   if (input.mode === "snapshot" && input.pieces.some((piece) => piece.kind === "fragment")) {
     throw new TimelineReadError("refused: a text fragment cannot remove items; pass it as a page");
+  }
+  if (
+    input.mode === "snapshot" &&
+    input.view === "messages" &&
+    input.pieces.some(
+      (piece) => hasTimelineIdentity(piece.item) && !inSnapshotScope("messages", piece.item),
+    )
+  ) {
+    throw new TimelineReadError(
+      "refused: a messages snapshot cannot include an activity-only item",
+    );
   }
   const unkeyed: ChairDetailItem[] = [];
   const working: TimelineRecord[] = [...input.previous];
@@ -399,7 +461,11 @@ export function reconcileTimeline(input: {
   const removed: TimelineRecord[] = [];
   for (const record of working) {
     const key = recordKey(record);
-    const inScope = record.endpoint === input.endpoint && record.threadId === input.threadId;
+    const inScope =
+      input.mode === "snapshot" &&
+      record.endpoint === input.endpoint &&
+      record.threadId === input.threadId &&
+      inSnapshotScope(input.view, record.item);
     if (inScope && key !== undefined && !seen.has(key)) removed.push(record);
     else records.push(record);
   }

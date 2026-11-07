@@ -263,6 +263,7 @@ describe("reconcileTimeline", () => {
       pieces: [full(item({ itemId: "item-b", text: "beta", messageId: "msg-b", position: 0 }))],
       hasMore: false,
       mode: "snapshot",
+      view: "messages",
     });
 
     expect(out.removed.map((entry) => entry.item.itemId)).toEqual(["item-a"]);
@@ -282,6 +283,7 @@ describe("reconcileTimeline", () => {
         pieces: [],
         hasMore: true,
         mode: "snapshot",
+        view: "messages",
       }),
     ).toThrow(TimelineReadError);
     expect(previous).toHaveLength(1);
@@ -295,6 +297,7 @@ describe("reconcileTimeline", () => {
       pieces: [full(item({ sourceThreadId: null, itemId: null, text: "loose" }))],
       hasMore: false,
       mode: "snapshot",
+      view: "messages",
     });
     expect(out.records).toEqual([]);
     expect(out.unkeyed.map((entry) => entry.text)).toEqual(["loose"]);
@@ -321,6 +324,7 @@ describe("reconcileTimeline", () => {
       ],
       hasMore: false,
       mode: "snapshot",
+      view: "messages",
     });
     expect(out.removed.map((entry) => entry.item.itemId)).toEqual(["item-a"]);
   });
@@ -614,6 +618,182 @@ describe("reconcileTimeline", () => {
     });
     expect(merged.records[0]?.item.text).toBe("abcdefghij");
     expect(merged.records[0]?.item.text).not.toBe("efghij");
+  });
+
+  it("keeps activity items when a messages snapshot is complete", () => {
+    const message = item({
+      itemId: "item-msg",
+      type: "user_message",
+      text: "hello",
+      position: 0,
+      updatedAt: "2026-11-01T00:00:00.000Z",
+    });
+    const tool = item({
+      itemId: "item-tool",
+      type: "tool",
+      text: "ran",
+      messageId: null,
+      position: 1,
+      updatedAt: "2026-11-01T00:00:00.000Z",
+    });
+    const assistant = item({
+      itemId: "item-assistant",
+      type: "assistant_message",
+      text: "done",
+      position: 3,
+      updatedAt: "2026-11-01T00:00:00.000Z",
+    });
+    const stored = reconcileTimeline({
+      previous: [],
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [full(message), full(tool), full(assistant)],
+      hasMore: true,
+      mode: "page",
+    });
+    const out = reconcileTimeline({
+      previous: stored.records,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [full({ ...message, position: 6 })],
+      hasMore: false,
+      mode: "snapshot",
+      view: "messages",
+    });
+    expect(out.removed.map((entry) => entry.item.itemId)).toEqual(["item-assistant"]);
+    expect(out.records.map((entry) => entry.item.itemId)).toEqual(["item-msg", "item-tool"]);
+    expect(out.records.find((entry) => entry.item.itemId === "item-msg")?.item.position).toBe(6);
+    expect(out.records.find((entry) => entry.item.itemId === "item-tool")?.item.text).toBe("ran");
+
+    const activity = reconcileTimeline({
+      previous: out.records,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [full({ ...message, position: 6 })],
+      hasMore: false,
+      mode: "snapshot",
+      view: "activity",
+    });
+    expect(activity.removed.map((entry) => entry.item.itemId)).toEqual(["item-tool"]);
+    expect(() =>
+      reconcileTimeline({
+        previous: stored.records,
+        endpoint: ENDPOINT,
+        threadId: THREAD,
+        pieces: [full(message), full(tool)],
+        hasMore: false,
+        mode: "snapshot",
+        view: "messages",
+      }),
+    ).toThrow(/activity-only/);
+  });
+
+  it("does not mark a finished item truncated when a duplicate fragment is retried", () => {
+    const updatedAt = "2026-11-01T00:00:00.000Z";
+    const opened = reconcileTimeline({
+      previous: [],
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [
+        full(
+          item({
+            text: "abcdefghij",
+            textTruncated: false,
+            nextTextOffset: null,
+            updatedAt,
+          }),
+        ),
+      ],
+      hasMore: false,
+      mode: "page",
+    });
+    const out = reconcileTimeline({
+      previous: opened.records,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [
+        fragment(
+          item({
+            text: "ghij",
+            textTruncated: true,
+            nextTextOffset: 10,
+            updatedAt,
+          }),
+          6,
+        ),
+      ],
+      hasMore: true,
+      mode: "page",
+    });
+    expect(out.records[0]?.item.text).toBe("abcdefghij");
+    expect(out.records[0]?.item.textTruncated).toBe(false);
+    expect(out.records[0]?.item.nextTextOffset).toBeNull();
+  });
+
+  it("moves position on a same-version truncated prefix without shrinking the text", () => {
+    const updatedAt = "2026-11-01T00:00:00.000Z";
+    const assembled = `${"a".repeat(200)}tail`;
+    const previous = [
+      record(
+        item({
+          text: assembled,
+          textTruncated: false,
+          nextTextOffset: null,
+          position: 1,
+          status: "running",
+          updatedAt,
+        }),
+      ),
+    ];
+    const out = reconcileTimeline({
+      previous,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [
+        full(
+          item({
+            text: assembled.slice(0, 200),
+            textTruncated: true,
+            nextTextOffset: 200,
+            position: 8,
+            status: "completed",
+            updatedAt,
+          }),
+        ),
+      ],
+      hasMore: true,
+      mode: "page",
+    });
+    expect(out.records[0]?.item.text).toBe(assembled);
+    expect(out.records[0]?.item.textTruncated).toBe(false);
+    expect(out.records[0]?.item.position).toBe(8);
+    expect(out.records[0]?.item.status).toBe("completed");
+  });
+
+  it("refuses a missing updatedAt instead of replacing stored text", () => {
+    const previous = [
+      record(item({ text: "abcdefghij", textTruncated: false, nextTextOffset: null })),
+    ];
+    expect(() =>
+      reconcileTimeline({
+        previous,
+        endpoint: ENDPOINT,
+        threadId: THREAD,
+        pieces: [
+          full(
+            item({
+              text: "ab",
+              textTruncated: true,
+              nextTextOffset: 2,
+              updatedAt: null,
+            }),
+          ),
+        ],
+        hasMore: true,
+        mode: "page",
+      }),
+    ).toThrow(/updatedAt and text are required/);
+    expect(previous[0]?.item.text).toBe("abcdefghij");
   });
 });
 
