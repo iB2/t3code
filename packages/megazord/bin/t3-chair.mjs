@@ -35,6 +35,7 @@
  *   node bin/t3-chair.mjs inbox [--project <id|title>]
  *   node bin/t3-chair.mjs threads --project <id|title> [--status <s>] [--limit 30]
  *   node bin/t3-chair.mjs read --thread <id> [--messages 6] [--chars 4000]
+ *        [--detail] [--view messages|activity] [--after <n>] [--item <id>] [--offset <n>]
  *   node bin/t3-chair.mjs open --project <id|title> --title "<t>" --task "<brief>" --why "<reason>"
  *        [--account "<name>" | --instance <id>] [--model <id>] [--runtime <mode>] [--no-start]
  *        [--base <branch> | --in-place] [--effort <level>]
@@ -49,10 +50,26 @@
  *
  * Every verb that touches threads takes `--env <name>`.
  *
- * `open` sets the model's effort to `high` unless `--effort` says otherwise (it
- * needs `--account` to know the model; without one T3's project default
- * stands). `continue --effort` changes an existing thread's level from that
- * turn on. `read` reports the level a thread is set to.
+ * `open` sets the model's effort to `high` unless `--effort` says otherwise.
+ * It needs `--account` or `--instance` to see the model's levels. When that
+ * model does not offer the required level, `open` refuses and does not launch.
+ * Without an account the model is unknown, so `open` cannot attach an effort.
+ * `continue --effort` changes an existing thread's level from that turn on.
+ * `read` reports the level a thread is set to.
+ *
+ * `read` prints the last messages as role, time, and text. `--detail` is
+ * opt-in and returns one page of `messages` or `activity` with the server's
+ * item identity, origin, and truncation fields. `--after` repeats the previous
+ * page's `nextPosition` and is omitted on the first page. That number is an
+ * index in the whole visible timeline, so a messages page can show positions
+ * 0, 3, 6. It is not a durable cursor. `--item` with `--offset` above 0
+ * returns a text fragment (`textKind` is `fragment`). The command does not
+ * stitch that fragment onto earlier text.
+ *
+ * `read` and `continue --effort` use `t3_thread_configure`. A read omits
+ * `modelSelection`. A write sends `modelSelection.options` as `{ id, value }`.
+ * A pending question on that read uses `t3_pending_request`. `queue` and
+ * `answer` still call the older tool names.
  *
  * `open` gives each new thread its own worktree, branched from
  * `origin/<base>` (default `main`), so threads in the same project can run side
@@ -87,11 +104,13 @@ import {
   NEEDS_DECISION,
   assertInstanceAllowed,
   classifyMcpThread,
+  effortLevelsFor,
   settleRefusal,
   parsePolicy,
   projectVisible,
   threadVisible,
 } from "../src/chair.ts";
+import { legacyTimelineMessages, readDetailItem, threadReadArgs } from "../src/threadRead.ts";
 import { defaultBaseDir } from "../src/dispatch.ts";
 import {
   McpToolError,
@@ -111,6 +130,10 @@ const VALUE_FLAGS = new Set([
   "limit",
   "messages",
   "chars",
+  "view",
+  "after",
+  "item",
+  "offset",
   "title",
   "task",
   "why",
@@ -130,7 +153,15 @@ const VALUE_FLAGS = new Set([
   "task-file",
   "answer-file",
 ]);
-const BOOL_FLAGS = new Set(["wait", "no-start", "no-browser", "in-place", "drop-queued", "help"]);
+const BOOL_FLAGS = new Set([
+  "wait",
+  "no-start",
+  "no-browser",
+  "in-place",
+  "drop-queued",
+  "detail",
+  "help",
+]);
 const RUNTIME_MODES = ["approval-required", "auto-accept-edits", "auto", "full-access"];
 
 /** A malformed command (exit 2). Thrown, never exit()ed: see main. */
@@ -164,6 +195,14 @@ function intFlag(args, name, fallback) {
   if (args[name] === undefined) return fallback;
   const n = Number(args[name]);
   if (!Number.isInteger(n) || n <= 0) usage(`--${name} must be a positive integer`);
+  return n;
+}
+
+/** A page index or a text offset. `0` is valid and is not the same as omitting it. */
+function nonNegFlag(args, name) {
+  if (args[name] === undefined) return undefined;
+  const n = Number(args[name]);
+  if (!Number.isInteger(n) || n < 0) usage(`--${name} must be an integer >= 0`);
   return n;
 }
 
@@ -293,13 +332,8 @@ async function openSession(args) {
         models: p.models.map((m) => m.id),
       }));
   /** The reasoning levels a model offers here (its `effort` option), or [] if it has none. */
-  const effortLevels = async (instanceId, model) => {
-    const provider = (await allProviders()).find((p) => p.providerInstanceId === instanceId);
-    const option = (provider?.models ?? [])
-      .find((m) => m.id === model)
-      ?.options?.find((o) => o.id === "effort");
-    return (option?.options ?? []).map((o) => o.id);
-  };
+  const effortLevels = async (instanceId, model) =>
+    effortLevelsFor(await allProviders(), instanceId, model);
   const accountName = async (instanceId) =>
     (await allProviders()).find((p) => p.providerInstanceId === instanceId)?.displayName ??
     instanceId;
@@ -349,11 +383,16 @@ function questionOf(request) {
 async function pendingQuestion(session, threadId, requestId) {
   let id = requestId;
   if (id === undefined) {
-    const { requestIds } = await session.mcp.call("t3_pending_request_list", { threadId });
+    const { requestIds } = await session.mcp.call("t3_pending_request", {
+      action: "list",
+      threadId,
+    });
     id = requestIds?.[0];
   }
   if (id === undefined) return undefined;
-  return questionOf(await session.mcp.call("t3_pending_request_read", { threadId, requestId: id }));
+  return questionOf(
+    await session.mcp.call("t3_pending_request", { action: "read", threadId, requestId: id }),
+  );
 }
 
 /**
@@ -497,8 +536,6 @@ async function summarize(session, row, state) {
   };
 }
 
-const ROLE = { user_message: "user", assistant_message: "assistant", proposed_plan: "plan" };
-
 /** The last `count` conversation messages of a thread, oldest first. */
 async function lastMessages(session, threadId, count, chars, itemCount, runId) {
   const collect = async (start) => {
@@ -511,15 +548,7 @@ async function lastMessages(session, threadId, count, chars, itemCount, runId) {
         maxCharsPerItem: chars,
         ...(after >= 0 ? { afterPosition: after } : {}),
       });
-      for (const item of page.items ?? []) {
-        if (runId !== undefined && item.runId !== runId) continue;
-        if (item.status === "running" || String(item.text ?? "").trim() === "") continue;
-        out.push({
-          role: ROLE[item.type] ?? item.type,
-          at: item.updatedAt,
-          text: item.textTruncated ? `${item.text}… [truncated]` : item.text,
-        });
-      }
+      out.push(...legacyTimelineMessages(page.items ?? [], runId));
       after = page.hasMore ? page.nextPosition : null;
     }
     return out.slice(-count);
@@ -647,9 +676,12 @@ async function assertEffort(session, instanceId, model, effort) {
   }
 }
 
-/** The effort a thread is set to, as T3 recorded it. */
+/**
+ * The effort a thread is set to, as T3 recorded it.
+ * v0.1.7 reads this from `t3_thread_configure` with no model selection.
+ */
 async function threadEffort(session, threadId) {
-  const config = await session.mcp.call("t3_thread_configuration", { threadId });
+  const config = await session.mcp.call("t3_thread_configure", { threadId });
   const option = (config.modelSelection?.options ?? []).find((o) => o.id === "effort");
   return option?.value ?? "model default";
 }
@@ -811,18 +843,66 @@ const VERBS = {
 
   async read(session, args) {
     need(args, "thread");
-    const row = await session.getThread(args.thread);
-    const state = await stateOf(session, row);
+    const detail = args.detail === true;
     const count = intFlag(args, "messages", 6);
     const chars = intFlag(args, "chars", 4000);
-    const messages = (
-      await lastMessages(session, row.id, count, chars, Number(row.mcp.itemCount ?? 0))
-    ).map((m) => ({ ...m, text: clip(m.text, chars) }));
-    return {
+    let pageRequest;
+    if (!detail) {
+      for (const name of ["view", "after", "item", "offset"]) {
+        if (args[name] !== undefined) usage(`--${name} needs --detail`);
+      }
+    } else {
+      const view = args.view ?? "messages";
+      if (view !== "messages" && view !== "activity") usage("--view must be messages or activity");
+      if (count > 100) usage("--messages must be at most 100 with --detail");
+      if (chars > 50_000) usage("--chars must be at most 50000 with --detail");
+      const textOffset = nonNegFlag(args, "offset");
+      const afterPosition = nonNegFlag(args, "after");
+      if (textOffset !== undefined && args.item === undefined) usage("--offset needs --item");
+      pageRequest = threadReadArgs({
+        threadId: String(args.thread).trim(),
+        view,
+        limit: count,
+        maxCharsPerItem: chars,
+        ...(afterPosition === undefined ? {} : { afterPosition }),
+        ...(args.item === undefined ? {} : { itemId: args.item }),
+        ...(textOffset === undefined ? {} : { textOffset }),
+      });
+    }
+    const row = await session.getThread(args.thread);
+    const state = await stateOf(session, row);
+    const summary = {
       ...(await summarize(session, row, state)),
       effort: await threadEffort(session, row.id),
       branch: row.branch,
-      messages,
+    };
+    if (pageRequest === undefined) {
+      const messages = (
+        await lastMessages(session, row.id, count, chars, Number(row.mcp.itemCount ?? 0))
+      ).map((m) => ({ ...m, text: clip(m.text, chars) }));
+      // Known baseline, not a complete truncation report. A server-cut item is
+      // marked `… [truncated]` and then clipped to `--chars`. When that marked
+      // string is longer than `--chars`, the marker is cut off and `+N chars`
+      // counts the marker, not the unread remainder still on the server.
+      return { ...summary, messages };
+    }
+    const page = await session.mcp.call("t3_thread_read", { ...pageRequest, threadId: row.id });
+    const textOffset = pageRequest.textOffset ?? null;
+    const textKind =
+      pageRequest.itemId !== undefined && textOffset !== null && textOffset > 0
+        ? "fragment"
+        : "item";
+    return {
+      ...summary,
+      endpoint: session.env.mcpUrl,
+      view: pageRequest.view,
+      afterPosition: pageRequest.afterPosition ?? null,
+      itemId: pageRequest.itemId ?? null,
+      textKind,
+      textOffset,
+      nextPosition: page.nextPosition ?? null,
+      hasMore: page.hasMore === true,
+      items: (page.items ?? []).map(readDetailItem),
     };
   },
 
@@ -864,10 +944,10 @@ const VERBS = {
     }
     // Without options a model runs at its own default effort (medium for Opus
     // 5.5), not the level the app's composer is set to: the desktop settings
-    // never reach a thread opened over MCP. So `open` asks for DEFAULT_EFFORT
-    // unless told otherwise, whenever it knows the account and the model has
-    // that level. With no account it cannot know the model, so it leaves T3's
-    // project default alone.
+    // never reach a thread opened over MCP. When the account is known, `open`
+    // requires DEFAULT_EFFORT and refuses instead of launching without it.
+    // With no account the model is unknown, so this command cannot attach an
+    // effort it has not checked.
     let effort;
     if (args.effort !== undefined) {
       if (modelSelection?.instanceId === undefined)
@@ -876,7 +956,12 @@ const VERBS = {
       effort = args.effort;
     } else if (modelSelection?.instanceId !== undefined) {
       const levels = await session.effortLevels(modelSelection.instanceId, modelSelection.model);
-      if (levels.includes(DEFAULT_EFFORT)) effort = DEFAULT_EFFORT;
+      if (!levels.includes(DEFAULT_EFFORT)) {
+        throw new ChairRefusal(
+          `refused: open requires effort '${DEFAULT_EFFORT}' and ${modelSelection.model} offers ${levels.join(", ") || "no effort setting"}`,
+        );
+      }
+      effort = DEFAULT_EFFORT;
     }
     if (effort !== undefined) {
       modelSelection = { ...modelSelection, options: [{ id: "effort", value: effort }] };
@@ -952,7 +1037,7 @@ const VERBS = {
     // it holds for this turn and the ones after it.
     let selection;
     if (args.effort !== undefined) {
-      const config = await session.mcp.call("t3_thread_configuration", { threadId: row.id });
+      const config = await session.mcp.call("t3_thread_configure", { threadId: row.id });
       selection = config.modelSelection ?? {};
       await assertEffort(session, selection.instanceId, selection.model, args.effort);
     }
