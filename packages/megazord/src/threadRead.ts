@@ -305,12 +305,38 @@ function mergeFragment(
 }
 
 /**
+ * A same-version full item must not replace a longer stored text with a
+ * matching truncated prefix. A different `updatedAt` replaces the record.
+ * Same-version text that is not a prefix either way is refused.
+ */
+function applyFullItem(
+  stored: ChairDetailItem | undefined,
+  incoming: ChairDetailItem,
+): ChairDetailItem {
+  if (stored === undefined || stored.text === null || incoming.text === null) return incoming;
+  const sameVersion =
+    stored.updatedAt !== null &&
+    incoming.updatedAt !== null &&
+    stored.updatedAt === incoming.updatedAt;
+  if (!sameVersion) return incoming;
+  if (incoming.text === stored.text) {
+    return stored.textTruncated === false && incoming.textTruncated ? stored : incoming;
+  }
+  if (stored.text.startsWith(incoming.text) && incoming.textTruncated) return stored;
+  if (incoming.text.startsWith(stored.text)) return incoming;
+  throw new TimelineReadError(
+    "refused: a full item of the same version contradicts the text already kept",
+  );
+}
+
+/**
  * Merge one read into the records already kept.
  *
  * The chair command does not call this. A caller passes `pieces`. A full item
- * replaces the stored text. A fragment is stitched on only when its offset
- * matches text already kept. A mismatched fragment throws, and `previous` is
- * left untouched.
+ * from another version replaces the stored text. A same-version truncated
+ * prefix does not shrink a longer record. A fragment is stitched on only when
+ * its offset matches text already kept. A mismatched fragment throws, and
+ * `previous` is left untouched.
  *
  * `page` updates and inserts. It does not remove, because a short page is not
  * evidence that an unseen item is gone. `snapshot` is a full reread of full
@@ -355,7 +381,9 @@ export function reconcileTimeline(input: {
     });
     const index = working.findIndex((record) => recordKey(record) === key);
     const nextItem =
-      piece.kind === "item" ? piece.item : mergeFragment(working[index]?.item, piece);
+      piece.kind === "item"
+        ? applyFullItem(working[index]?.item, piece.item)
+        : mergeFragment(working[index]?.item, piece);
     const record: TimelineRecord = {
       endpoint: input.endpoint,
       threadId: input.threadId,

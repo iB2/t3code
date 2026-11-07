@@ -310,7 +310,14 @@ describe("reconcileTimeline", () => {
       endpoint: ENDPOINT,
       threadId: THREAD,
       pieces: [
-        full(item({ itemId: "item-b", messageId: "msg-b", text: "only the page that arrived" })),
+        full(
+          item({
+            itemId: "item-b",
+            messageId: "msg-b",
+            text: "only the page that arrived",
+            updatedAt: "2026-11-06T00:00:00.000Z",
+          }),
+        ),
       ],
       hasMore: false,
       mode: "snapshot",
@@ -459,6 +466,105 @@ describe("reconcileTimeline", () => {
       ),
     ).toThrow(/nextTextOffset/);
     expect(previous[0]?.item.text).toBe("hello");
+  });
+
+  it("keeps a longer same-version record when a full read is only its truncated prefix", () => {
+    const assembled = `${"a".repeat(200)}b`.padEnd(4391, "c");
+    const previous = [
+      record(
+        item({
+          text: assembled,
+          textTruncated: false,
+          nextTextOffset: null,
+          updatedAt: "2026-11-01T00:00:00.000Z",
+        }),
+      ),
+    ];
+    const out = reconcileTimeline({
+      previous,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [
+        full(
+          item({
+            text: assembled.slice(0, 200),
+            textTruncated: true,
+            nextTextOffset: 200,
+            updatedAt: "2026-11-01T00:00:00.000Z",
+          }),
+        ),
+      ],
+      hasMore: true,
+      mode: "page",
+    });
+    expect(out.records[0]?.item.text).toBe(assembled);
+    expect(out.records[0]?.item.textTruncated).toBe(false);
+    expect(previous[0]?.item.text).toBe(assembled);
+  });
+
+  it("replaces the record when the full item is a different version", () => {
+    const previous = [
+      record(
+        item({
+          text: "abcdefghij",
+          textTruncated: false,
+          nextTextOffset: null,
+          updatedAt: "2026-11-01T00:00:00.000Z",
+        }),
+      ),
+    ];
+    const out = reconcileTimeline({
+      previous,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [
+        full(
+          item({
+            text: "zz",
+            textTruncated: true,
+            nextTextOffset: 2,
+            updatedAt: "2026-11-05T00:00:00.000Z",
+          }),
+        ),
+      ],
+      hasMore: true,
+      mode: "page",
+    });
+    expect(out.records[0]?.item.text).toBe("zz");
+  });
+
+  it("refuses a fragment whose overlap contradicts the stored text", () => {
+    const previous = [
+      record(
+        item({
+          text: "prefix-KEEP-suffix",
+          textTruncated: false,
+          nextTextOffset: null,
+          updatedAt: "2026-11-01T00:00:00.000Z",
+        }),
+      ),
+    ];
+    expect(() =>
+      reconcileTimeline({
+        previous,
+        endpoint: ENDPOINT,
+        threadId: THREAD,
+        pieces: [
+          fragment(
+            item({
+              text: "XXXX",
+              textTruncated: false,
+              nextTextOffset: null,
+              updatedAt: "2026-11-01T00:00:00.000Z",
+            }),
+            "prefix-".length,
+          ),
+        ],
+        hasMore: true,
+        mode: "page",
+      }),
+    ).toThrow(/does not match/);
+    expect(previous[0]?.item.text).toBe("prefix-KEEP-suffix");
   });
 
   it("still replaces the stored text when a later read is a full item", () => {
