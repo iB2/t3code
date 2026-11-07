@@ -1,11 +1,17 @@
 /**
  * Opt-in timeline read for the chair.
  *
- * T3 rebuilds `position` for each response, so `afterPosition` only asks for
- * the next page of that response. The identity of an item is the endpoint,
- * the thread that was read, the source thread, and the item id. The read
- * thread stays in the key so a reread of one thread cannot delete another
- * thread's copy of an inherited item.
+ * T3 rebuilds `position` for each response. `afterPosition` is an index in the
+ * whole visible timeline, so a messages page can carry positions 0, 3, 6.
+ * It is not a durable cursor.
+ *
+ * The identity of an item is the endpoint, the thread that was read, the
+ * source thread, and the item id. The read thread stays in the key so a reread
+ * of one thread cannot delete another thread's copy of an inherited item.
+ *
+ * `reconcileTimeline` and `collectBoundedReads` are helpers for tests and for
+ * a caller that wants to fold pages. The chair command does not call them.
+ * `collectBoundedReads` only walks `afterPosition`. It does not stitch text.
  *
  * @module megazord/threadRead
  */
@@ -149,9 +155,11 @@ export interface ThreadReadArgs {
 /**
  * Arguments for `t3_thread_read`.
  *
- * Omit `afterPosition` on the first page. `0` means "after the item at
- * index 0", not "start". `textOffset` is sent only with `itemId`, which is
- * how the server applies it.
+ * Omit `afterPosition` on the first page. The value is an index in the whole
+ * visible timeline, including rows the messages view leaves out, so the next
+ * page may start at 0, 3, or 6. It is not a durable cursor. `textOffset` is
+ * sent only with `itemId`, which is how the server applies it. An offset above
+ * 0 asks for a text fragment, not a new copy of the whole item.
  */
 export function threadReadArgs(request: ThreadReadPageRequest): ThreadReadArgs {
   return {
@@ -183,6 +191,35 @@ export class TimelineReadError extends Error {
   }
 }
 
+/**
+ * A full item read starts at the beginning of the text, even when the server
+ * cut it. A fragment starts at `textOffset` and holds only the slice from
+ * there. Offsets are JavaScript string indexes, the same ones the server uses.
+ */
+export type TimelinePiece =
+  | { readonly kind: "item"; readonly item: ChairDetailItem }
+  | { readonly kind: "fragment"; readonly textOffset: number; readonly item: ChairDetailItem };
+
+/** Turn one detail response into pieces. A fragment is never labeled as a full item. */
+export function piecesFromDetail(input: {
+  readonly textKind: "item" | "fragment";
+  readonly textOffset: number | null;
+  readonly items: ReadonlyArray<ChairDetailItem>;
+}): ReadonlyArray<TimelinePiece> {
+  if (input.textKind === "item") {
+    if (input.textOffset !== null && input.textOffset !== 0) {
+      throw new TimelineReadError("refused: a full item read cannot start past the beginning");
+    }
+    return input.items.map((item) => ({ kind: "item", item }));
+  }
+  if (input.textOffset === null || !Number.isInteger(input.textOffset) || input.textOffset < 0) {
+    throw new TimelineReadError("refused: a text fragment needs an integer textOffset >= 0");
+  }
+  if (input.textOffset === 0) return input.items.map((item) => ({ kind: "item", item }));
+  const textOffset = input.textOffset;
+  return input.items.map((item) => ({ kind: "fragment", textOffset, item }));
+}
+
 export interface ReconcileOutcome {
   readonly records: ReadonlyArray<TimelineRecord>;
   readonly upserted: ReadonlyArray<TimelineRecord>;
@@ -200,20 +237,93 @@ function recordKey(record: TimelineRecord): string | undefined {
   });
 }
 
+function fragmentEnd(piece: Extract<TimelinePiece, { kind: "fragment" }>): number {
+  const text = piece.item.text;
+  if (text === null) throw new TimelineReadError("refused: a text fragment has no text");
+  if (!Number.isInteger(piece.textOffset) || piece.textOffset < 0) {
+    throw new TimelineReadError("refused: a text fragment offset must be an integer >= 0");
+  }
+  const end = piece.textOffset + text.length;
+  if (piece.item.textTruncated) {
+    if (piece.item.nextTextOffset !== end) {
+      throw new TimelineReadError(
+        "refused: a truncated fragment's nextTextOffset must equal textOffset plus the fragment length",
+      );
+    }
+  } else if (piece.item.nextTextOffset !== null) {
+    throw new TimelineReadError("refused: a finished fragment must leave nextTextOffset empty");
+  }
+  return end;
+}
+
+/**
+ * Keep the stored prefix. Append only the slice that begins where the stored
+ * text ends, or accept an exact retry of a slice already kept. Anything else
+ * is refused and the caller keeps the previous records.
+ */
+function mergeFragment(
+  stored: ChairDetailItem | undefined,
+  piece: Extract<TimelinePiece, { kind: "fragment" }>,
+): ChairDetailItem {
+  const text = piece.item.text;
+  if (text === null) throw new TimelineReadError("refused: a text fragment has no text");
+  fragmentEnd(piece);
+  if (stored === undefined || stored.text === null) {
+    if (piece.textOffset !== 0) {
+      throw new TimelineReadError("refused: a text fragment arrived before its prefix");
+    }
+    return piece.item;
+  }
+  if (
+    stored.updatedAt !== null &&
+    piece.item.updatedAt !== null &&
+    stored.updatedAt !== piece.item.updatedAt
+  ) {
+    throw new TimelineReadError(
+      "refused: the item changed during continuation; reread it as a full item",
+    );
+  }
+  const have = stored.text;
+  if (piece.textOffset > have.length) {
+    throw new TimelineReadError(
+      "refused: a text fragment leaves a gap before the text already kept",
+    );
+  }
+  const overlap = have.slice(piece.textOffset, piece.textOffset + text.length);
+  if (overlap !== text.slice(0, overlap.length)) {
+    throw new TimelineReadError("refused: a text fragment does not match the text already kept");
+  }
+  if (piece.textOffset + text.length < have.length) return stored;
+  const assembled = have.slice(0, piece.textOffset) + text;
+  return {
+    ...stored,
+    ...piece.item,
+    text: assembled,
+    textTruncated: piece.item.textTruncated,
+    nextTextOffset: piece.item.nextTextOffset,
+  };
+}
+
 /**
  * Merge one read into the records already kept.
  *
+ * The chair command does not call this. A caller passes `pieces`. A full item
+ * replaces the stored text. A fragment is stitched on only when its offset
+ * matches text already kept. A mismatched fragment throws, and `previous` is
+ * left untouched.
+ *
  * `page` updates and inserts. It does not remove, because a short page is not
- * evidence that an unseen item is gone. `snapshot` is a full reread of one
- * thread (`hasMore` false) and replaces that thread's records. There is no
- * promise that the pages were a consistent server snapshot: an item skipped
- * because the timeline moved is reported removed.
+ * evidence that an unseen item is gone. `snapshot` is a full reread of full
+ * items (`hasMore` false) and replaces that thread's records. A fragment
+ * cannot remove items. There is no promise that the pages were a consistent
+ * server snapshot: an item skipped because the timeline moved is reported
+ * removed.
  */
 export function reconcileTimeline(input: {
   readonly previous: ReadonlyArray<TimelineRecord>;
   readonly endpoint: string;
   readonly threadId: string;
-  readonly items: ReadonlyArray<ChairDetailItem>;
+  readonly pieces: ReadonlyArray<TimelinePiece>;
   readonly hasMore: boolean;
   readonly mode: "page" | "snapshot";
 }): ReconcileOutcome {
@@ -222,49 +332,48 @@ export function reconcileTimeline(input: {
       "refused: a page with hasMore is not a full reread, so it cannot remove items",
     );
   }
-  const unkeyed = input.items.filter((item) => !hasTimelineIdentity(item));
-  const incoming = new Map<string, TimelineRecord>();
-  for (const item of input.items) {
-    if (!hasTimelineIdentity(item)) continue;
-    const record: TimelineRecord = { endpoint: input.endpoint, threadId: input.threadId, item };
-    incoming.set(
-      timelineKey({
-        endpoint: input.endpoint,
-        threadId: input.threadId,
-        sourceThreadId: item.sourceThreadId,
-        itemId: item.itemId,
-      }),
-      record,
-    );
+  if (input.mode === "snapshot" && input.pieces.some((piece) => piece.kind === "fragment")) {
+    throw new TimelineReadError("refused: a text fragment cannot remove items; pass it as a page");
   }
+  const unkeyed: ChairDetailItem[] = [];
+  const working: TimelineRecord[] = [...input.previous];
+  const seen = new Set<string>();
+  const upserted: TimelineRecord[] = [];
+  for (const piece of input.pieces) {
+    if (!hasTimelineIdentity(piece.item)) {
+      if (piece.kind === "fragment") {
+        throw new TimelineReadError("refused: a text fragment has no item identity");
+      }
+      unkeyed.push(piece.item);
+      continue;
+    }
+    const key = timelineKey({
+      endpoint: input.endpoint,
+      threadId: input.threadId,
+      sourceThreadId: piece.item.sourceThreadId,
+      itemId: piece.item.itemId,
+    });
+    const index = working.findIndex((record) => recordKey(record) === key);
+    const nextItem =
+      piece.kind === "item" ? piece.item : mergeFragment(working[index]?.item, piece);
+    const record: TimelineRecord = {
+      endpoint: input.endpoint,
+      threadId: input.threadId,
+      item: nextItem,
+    };
+    if (index >= 0) working[index] = record;
+    else working.push(record);
+    seen.add(key);
+    upserted.push(record);
+  }
+  if (input.mode === "page") return { records: working, upserted, removed: [], unkeyed };
   const records: TimelineRecord[] = [];
   const removed: TimelineRecord[] = [];
-  const seen = new Set<string>();
-  for (const record of input.previous) {
+  for (const record of working) {
     const key = recordKey(record);
-    if (key === undefined) {
-      records.push(record);
-      continue;
-    }
-    const next = incoming.get(key);
     const inScope = record.endpoint === input.endpoint && record.threadId === input.threadId;
-    if (input.mode === "snapshot" && inScope) {
-      if (next === undefined) removed.push(record);
-      else {
-        records.push(next);
-        seen.add(key);
-      }
-      continue;
-    }
-    if (next !== undefined) {
-      records.push(next);
-      seen.add(key);
-    } else records.push(record);
-  }
-  const upserted: TimelineRecord[] = [];
-  for (const [key, record] of incoming) {
-    upserted.push(record);
-    if (!seen.has(key)) records.push(record);
+    if (inScope && key !== undefined && !seen.has(key)) removed.push(record);
+    else records.push(record);
   }
   return { records, upserted, removed, unkeyed };
 }
@@ -285,7 +394,8 @@ export interface BoundedReadResult<T> {
 /**
  * Read at most `maxPages` pages. The first call omits `afterPosition`.
  * This stops at the cap, when the server reports no further page, or when
- * `nextPosition` does not move forward. It does not run a watcher.
+ * `nextPosition` does not move forward. The chair command does not call this.
+ * The helper does not stitch text fragments.
  */
 export async function collectBoundedReads<T>(input: {
   readonly maxPages: number;

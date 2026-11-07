@@ -58,9 +58,15 @@
  * `read` prints the last messages as role, time, and text. `--detail` is
  * opt-in and returns one page of `messages` or `activity` with the server's
  * item identity, origin, and truncation fields. `--after` repeats the previous
- * page's `nextPosition` and is omitted on the first page. It is a page hint,
- * not a durable cursor. `--item` with `--offset` continues a cut item
- * (`offset` is that item's `nextTextOffset`).
+ * page's `nextPosition` and is omitted on the first page. That number is an
+ * index in the whole visible timeline, so a messages page can show positions
+ * 0, 3, 6. It is not a durable cursor. `--item` with `--offset` above 0
+ * returns a text fragment (`textKind` is `fragment`). The command does not
+ * stitch that fragment onto earlier text.
+ *
+ * `read` asks `t3_thread_configure` with no model selection, and reads a
+ * pending question with `t3_pending_request`. `queue`, `answer`, and
+ * `continue --effort` still call the older tool names.
  *
  * `open` gives each new thread its own worktree, branched from
  * `origin/<base>` (default `main`), so threads in the same project can run side
@@ -878,13 +884,19 @@ const VERBS = {
       return { ...summary, messages };
     }
     const page = await session.mcp.call("t3_thread_read", { ...pageRequest, threadId: row.id });
+    const textOffset = pageRequest.textOffset ?? null;
+    const textKind =
+      pageRequest.itemId !== undefined && textOffset !== null && textOffset > 0
+        ? "fragment"
+        : "item";
     return {
       ...summary,
       endpoint: session.env.mcpUrl,
       view: pageRequest.view,
       afterPosition: pageRequest.afterPosition ?? null,
       itemId: pageRequest.itemId ?? null,
-      textOffset: pageRequest.textOffset ?? null,
+      textKind,
+      textOffset,
       nextPosition: page.nextPosition ?? null,
       hasMore: page.hasMore === true,
       items: (page.items ?? []).map(readDetailItem),

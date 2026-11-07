@@ -4,10 +4,12 @@ import {
   TimelineReadError,
   collectBoundedReads,
   legacyTimelineMessages,
+  piecesFromDetail,
   readDetailItem,
   reconcileTimeline,
   threadReadArgs,
   type ChairDetailItem,
+  type TimelinePiece,
   type TimelineRecord,
 } from "./threadRead.ts";
 
@@ -37,6 +39,14 @@ function item(over: Partial<ChairDetailItem> = {}): ChairDetailItem {
 
 function record(entry: ChairDetailItem, threadId = THREAD, endpoint = ENDPOINT): TimelineRecord {
   return { endpoint, threadId, item: entry };
+}
+
+function full(entry: ChairDetailItem): TimelinePiece {
+  return { kind: "item", item: entry };
+}
+
+function fragment(entry: ChairDetailItem, textOffset: number): TimelinePiece {
+  return { kind: "fragment", textOffset, item: entry };
 }
 
 describe("legacyTimelineMessages", () => {
@@ -217,7 +227,7 @@ describe("reconcileTimeline", () => {
       previous,
       endpoint: ENDPOINT,
       threadId: THREAD,
-      items: [nextB, inserted],
+      pieces: [full(nextB), full(inserted)],
       hasMore: true,
       mode: "page",
     });
@@ -250,7 +260,7 @@ describe("reconcileTimeline", () => {
       previous,
       endpoint: ENDPOINT,
       threadId: THREAD,
-      items: [item({ itemId: "item-b", text: "beta", messageId: "msg-b", position: 0 })],
+      pieces: [full(item({ itemId: "item-b", text: "beta", messageId: "msg-b", position: 0 }))],
       hasMore: false,
       mode: "snapshot",
     });
@@ -269,7 +279,7 @@ describe("reconcileTimeline", () => {
         previous,
         endpoint: ENDPOINT,
         threadId: THREAD,
-        items: [],
+        pieces: [],
         hasMore: true,
         mode: "snapshot",
       }),
@@ -282,7 +292,7 @@ describe("reconcileTimeline", () => {
       previous: [],
       endpoint: ENDPOINT,
       threadId: THREAD,
-      items: [item({ sourceThreadId: null, itemId: null, text: "loose" })],
+      pieces: [full(item({ sourceThreadId: null, itemId: null, text: "loose" }))],
       hasMore: false,
       mode: "snapshot",
     });
@@ -299,11 +309,205 @@ describe("reconcileTimeline", () => {
       previous,
       endpoint: ENDPOINT,
       threadId: THREAD,
-      items: [item({ itemId: "item-b", messageId: "msg-b", text: "only the page that arrived" })],
+      pieces: [
+        full(item({ itemId: "item-b", messageId: "msg-b", text: "only the page that arrived" })),
+      ],
       hasMore: false,
       mode: "snapshot",
     });
     expect(out.removed.map((entry) => entry.item.itemId)).toEqual(["item-a"]);
+  });
+
+  it("stitches a continuation onto the prefix and ignores an exact retry", () => {
+    const head = item({
+      text: "abcd",
+      textTruncated: true,
+      nextTextOffset: 4,
+      updatedAt: "2026-11-01T00:00:00.000Z",
+    });
+    const opened = reconcileTimeline({
+      previous: [],
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [full(head)],
+      hasMore: false,
+      mode: "page",
+    });
+    const cont = item({
+      text: "efgh",
+      textTruncated: true,
+      nextTextOffset: 8,
+      updatedAt: "2026-11-01T00:00:00.000Z",
+    });
+    const once = reconcileTimeline({
+      previous: opened.records,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [fragment(cont, 4)],
+      hasMore: true,
+      mode: "page",
+    });
+    const twice = reconcileTimeline({
+      previous: once.records,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [fragment(cont, 4)],
+      hasMore: true,
+      mode: "page",
+    });
+    const done = reconcileTimeline({
+      previous: twice.records,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [
+        fragment(
+          item({
+            text: "ij",
+            textTruncated: false,
+            nextTextOffset: null,
+            updatedAt: "2026-11-01T00:00:00.000Z",
+          }),
+          8,
+        ),
+      ],
+      hasMore: false,
+      mode: "page",
+    });
+
+    expect(once.records[0]?.item.text).toBe("abcdefgh");
+    expect(once.records[0]?.item.textTruncated).toBe(true);
+    expect(once.records[0]?.item.nextTextOffset).toBe(8);
+    expect(twice.records[0]?.item.text).toBe("abcdefgh");
+    expect(done.records[0]?.item).toMatchObject({
+      text: "abcdefghij",
+      textTruncated: false,
+      nextTextOffset: null,
+    });
+  });
+
+  it("refuses a gap, a mismatched slice, and a continuation after the item changes", () => {
+    const previous = [
+      record(
+        item({
+          text: "hello",
+          textTruncated: true,
+          nextTextOffset: 5,
+          updatedAt: "2026-11-01T00:00:00.000Z",
+        }),
+      ),
+    ];
+    const refuse = (piece: TimelinePiece) =>
+      reconcileTimeline({
+        previous,
+        endpoint: ENDPOINT,
+        threadId: THREAD,
+        pieces: [piece],
+        hasMore: true,
+        mode: "page",
+      });
+
+    expect(() =>
+      refuse(
+        fragment(
+          item({
+            text: "!",
+            textTruncated: false,
+            nextTextOffset: null,
+            updatedAt: "2026-11-01T00:00:00.000Z",
+          }),
+          7,
+        ),
+      ),
+    ).toThrow(/gap/);
+    expect(() =>
+      refuse(
+        fragment(
+          item({
+            text: "X",
+            textTruncated: false,
+            nextTextOffset: null,
+            updatedAt: "2026-11-01T00:00:00.000Z",
+          }),
+          4,
+        ),
+      ),
+    ).toThrow(/does not match/);
+    expect(() =>
+      refuse(
+        fragment(
+          item({
+            text: "!",
+            textTruncated: false,
+            nextTextOffset: null,
+            updatedAt: "2026-11-04T00:00:00.000Z",
+          }),
+          5,
+        ),
+      ),
+    ).toThrow(/changed during continuation/);
+    expect(() =>
+      refuse(
+        fragment(
+          item({
+            text: "!",
+            textTruncated: true,
+            nextTextOffset: 9,
+            updatedAt: "2026-11-01T00:00:00.000Z",
+          }),
+          5,
+        ),
+      ),
+    ).toThrow(/nextTextOffset/);
+    expect(previous[0]?.item.text).toBe("hello");
+  });
+
+  it("still replaces the stored text when a later read is a full item", () => {
+    const previous = [
+      record(item({ text: "abcdefghij", textTruncated: false, nextTextOffset: null })),
+    ];
+    const out = reconcileTimeline({
+      previous,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: [full(item({ text: "beta edited", updatedAt: "2026-11-03T00:00:00.000Z" }))],
+      hasMore: true,
+      mode: "page",
+    });
+    expect(out.records[0]?.item.text).toBe("beta edited");
+    expect(out.records).toHaveLength(1);
+  });
+
+  it("labels a detail continuation as a fragment before stitching it", () => {
+    const head = piecesFromDetail({
+      textKind: "item",
+      textOffset: null,
+      items: [item({ text: "abcd", textTruncated: true, nextTextOffset: 4 })],
+    });
+    const tail = piecesFromDetail({
+      textKind: "fragment",
+      textOffset: 4,
+      items: [item({ text: "efghij", textTruncated: false, nextTextOffset: null })],
+    });
+    expect(head[0]?.kind).toBe("item");
+    expect(tail[0]?.kind).toBe("fragment");
+    const opened = reconcileTimeline({
+      previous: [],
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: head,
+      hasMore: false,
+      mode: "page",
+    });
+    const merged = reconcileTimeline({
+      previous: opened.records,
+      endpoint: ENDPOINT,
+      threadId: THREAD,
+      pieces: tail,
+      hasMore: false,
+      mode: "page",
+    });
+    expect(merged.records[0]?.item.text).toBe("abcdefghij");
+    expect(merged.records[0]?.item.text).not.toBe("efghij");
   });
 });
 

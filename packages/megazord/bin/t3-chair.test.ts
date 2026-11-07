@@ -6,7 +6,7 @@ import * as NodePath from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import { ChairRefusal, parsePolicy, projectVisible, threadVisible } from "../src/chair.ts";
-import { reconcileTimeline } from "../src/threadRead.ts";
+import { piecesFromDetail, reconcileTimeline } from "../src/threadRead.ts";
 import { VERBS } from "./t3-chair.mjs";
 
 // T3's MCP clips a queued message to 1,000 characters in t3_queue_list and to
@@ -476,6 +476,8 @@ describe("read", () => {
     expect(out.messages).toBeUndefined();
     expect(out.endpoint).toBe("http://127.0.0.1:9/mcp");
     expect(out.view).toBe("messages");
+    expect(out.textKind).toBe("item");
+    expect(out.textOffset).toBeNull();
     expect(out.afterPosition).toBeNull();
     expect(out.hasMore).toBe(false);
     expect(out.items.map((item: { itemId: string }) => item.itemId)).toEqual([
@@ -546,6 +548,7 @@ describe("read", () => {
       chars: "4",
       messages: "1",
     });
+    expect(first.textKind).toBe("item");
     expect(first.items[0]).toMatchObject({
       itemId: "item-long",
       text: "abcd",
@@ -563,12 +566,15 @@ describe("read", () => {
       offset: "4",
       chars: "4",
     });
+    expect(rest.textKind).toBe("fragment");
+    expect(rest.textOffset).toBe(4);
     expect(rest.items[0]).toMatchObject({
       itemId: "item-long",
       text: "efgh",
       textTruncated: true,
       nextTextOffset: 8,
     });
+    expect(rest.items[0].text).not.toBe("abcdefghij");
 
     const nextPage = await VERBS.read(session, {
       verb: "read",
@@ -672,7 +678,7 @@ describe("read", () => {
       previous: [],
       endpoint: first.endpoint,
       threadId: first.threadId,
-      items: first.items,
+      pieces: piecesFromDetail(first),
       hasMore: first.hasMore,
       mode: "snapshot",
     });
@@ -680,7 +686,7 @@ describe("read", () => {
       previous: opened.records,
       endpoint: second.endpoint,
       threadId: second.threadId,
-      items: second.items,
+      pieces: piecesFromDetail(second),
       hasMore: second.hasMore,
       mode: "snapshot",
     });
@@ -698,7 +704,11 @@ describe("read", () => {
       previous: opened.records,
       endpoint: second.endpoint,
       threadId: second.threadId,
-      items: second.items.filter((item: { itemId: string }) => item.itemId === "item-c"),
+      pieces: piecesFromDetail({
+        textKind: "item",
+        textOffset: null,
+        items: second.items.filter((item: { itemId: string }) => item.itemId === "item-c"),
+      }),
       hasMore: true,
       mode: "page",
     });
