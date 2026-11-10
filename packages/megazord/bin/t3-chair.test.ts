@@ -5,7 +5,7 @@ import * as NodePath from "node:path";
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
-import { ChairRefusal } from "../src/chair.ts";
+import { ChairRefusal, effortLevelsFor, parsePolicy } from "../src/chair.ts";
 import { VERBS } from "./t3-chair.mjs";
 
 // T3's MCP clips a queued message to 1,000 characters in t3_queue_list and to
@@ -223,5 +223,190 @@ describe("queue", () => {
     expect(out.items[0].text.length).toBeGreaterThan(200);
     expect(writes(calls)).toEqual([]);
     expect(NodeFS.existsSync(NodePath.join(baseDir, "chair"))).toBe(false);
+  });
+});
+
+const OPEN_POLICY = parsePolicy({
+  blockedProjectIds: ["client-project"],
+  blockedInstanceIds: ["client-account"],
+});
+
+function capabilityProviders(effort: Record<string, unknown>) {
+  return [
+    {
+      providerInstanceId: "own-account",
+      models: [{ id: "opus", options: [{ id: "effort", ...effort }] }],
+    },
+  ];
+}
+
+function openHarness(dir: string, providers: ReadonlyArray<unknown>) {
+  const calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
+  const session = {
+    baseDir: dir,
+    env: { name: "local", mcpUrl: "http://127.0.0.1:9/mcp" },
+    policy: OPEN_POLICY,
+    projects: [{ id: "own-project", title: "Own" }],
+    accounts: async () => [{ account: "Claude", instanceId: "own-account", models: ["opus"] }],
+    effortLevels: async (instanceId: string, model: string) =>
+      effortLevelsFor(providers, instanceId, model),
+    accountName: async () => "Claude",
+    url: async (id: string) => `http://127.0.0.1:9/env/${id}`,
+    mcp: {
+      async call(tool: string, args: Record<string, unknown> = {}) {
+        calls.push({ tool, args });
+        if (tool === "t3_thread_launch") return { threadId: "thread-new" };
+        if (tool === "t3_thread_read") {
+          return {
+            thread: {
+              threadId: "thread-new",
+              providerInstanceId: "own-account",
+              model: "opus",
+              projectId: "own-project",
+            },
+          };
+        }
+        throw new Error(`unexpected tool ${tool}`);
+      },
+    },
+  };
+  return { session, calls };
+}
+
+const openArgs = {
+  verb: "open",
+  project: "own-project",
+  title: "effort pilot",
+  task: "Reply with the single word pong.",
+  why: "require effort high",
+  account: "Claude",
+  "no-start": true,
+};
+
+function launched(calls: ReadonlyArray<{ tool: string; args: Record<string, unknown> }>) {
+  return calls.find((call) => call.tool === "t3_thread_launch");
+}
+
+describe("open effort", () => {
+  it("sends effort high by default when v0.1.7 lists it in values", async () => {
+    const { session, calls } = openHarness(
+      await freshBaseDir(),
+      capabilityProviders({ values: ["low", "medium", "high", false] }),
+    );
+    const out = await VERBS.open(session, { ...openArgs });
+    expect(launched(calls)?.args["modelSelection"]).toEqual({
+      instanceId: "own-account",
+      model: "opus",
+      options: [{ id: "effort", value: "high" }],
+    });
+    expect(out.effort).toBe("high");
+  });
+
+  it("sends an explicit high", async () => {
+    const { session, calls } = openHarness(
+      await freshBaseDir(),
+      capabilityProviders({ values: ["low", "medium", "high"] }),
+    );
+    const out = await VERBS.open(session, { ...openArgs, effort: "high" });
+    expect(launched(calls)?.args["modelSelection"]).toEqual({
+      instanceId: "own-account",
+      model: "opus",
+      options: [{ id: "effort", value: "high" }],
+    });
+    expect(out.effort).toBe("high");
+  });
+
+  it("sends effort high from the older nested options shape", async () => {
+    const { session, calls } = openHarness(
+      await freshBaseDir(),
+      capabilityProviders({ options: [{ id: "low" }, { id: "high" }] }),
+    );
+    const out = await VERBS.open(session, { ...openArgs });
+    expect(launched(calls)?.args["modelSelection"]).toEqual({
+      instanceId: "own-account",
+      model: "opus",
+      options: [{ id: "effort", value: "high" }],
+    });
+    expect(out.effort).toBe("high");
+  });
+
+  it("refuses an effort the model does not offer and does not launch", async () => {
+    const { session, calls } = openHarness(
+      await freshBaseDir(),
+      capabilityProviders({ values: ["low", "medium"] }),
+    );
+    await expect(VERBS.open(session, { ...openArgs, effort: "high" })).rejects.toThrow(/opus/);
+    expect(launched(calls)).toBeUndefined();
+  });
+
+  it("refuses the default open when high is not offered and does not launch", async () => {
+    const { session, calls } = openHarness(
+      await freshBaseDir(),
+      capabilityProviders({ values: ["low", "medium"] }),
+    );
+    await expect(VERBS.open(session, { ...openArgs })).rejects.toThrow(ChairRefusal);
+    await expect(VERBS.open(session, { ...openArgs })).rejects.toThrow(/requires effort 'high'/);
+    expect(launched(calls)).toBeUndefined();
+  });
+});
+
+describe("continue --effort", () => {
+  it("reads and sets effort with t3_thread_configure", async () => {
+    const calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
+    const providers = capabilityProviders({ values: ["low", "high"] });
+    let selection: {
+      instanceId: string;
+      model: string;
+      options: Array<{ id: string; value: string }>;
+    } = { instanceId: "own-account", model: "opus", options: [] };
+    const session = {
+      baseDir: await freshBaseDir(),
+      env: { name: "local", mcpUrl: "http://127.0.0.1:9/mcp" },
+      effortLevels: async (instanceId: string, model: string) =>
+        effortLevelsFor(providers, instanceId, model),
+      url: async (id: string) => `http://127.0.0.1:9/env/${id}`,
+      getThread: async () => ({
+        id: "thread-1",
+        modelSelection: { instanceId: "own-account", model: "opus" },
+      }),
+      mcp: {
+        async call(tool: string, args: Record<string, unknown> = {}) {
+          calls.push({ tool, args });
+          if (tool === "t3_thread_configure" && args["modelSelection"] === undefined) {
+            return {
+              threadId: "thread-1",
+              modelSelection: selection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+            };
+          }
+          if (tool === "t3_thread_configure") {
+            selection = args["modelSelection"] as typeof selection;
+            return { sequence: 1 };
+          }
+          if (tool === "t3_thread_send") return { runId: "run-9" };
+          throw new Error(`unexpected tool ${tool}`);
+        },
+      },
+    };
+    const out = await VERBS.continue(session, {
+      verb: "continue",
+      thread: "thread-1",
+      task: "Reply with the single word pong.",
+      why: "set effort",
+      effort: "high",
+    });
+    expect(out.effort).toBe("high");
+    const configured = calls.filter(
+      (call) => call.tool === "t3_thread_configure" && call.args["modelSelection"] !== undefined,
+    );
+    expect(configured).toHaveLength(1);
+    expect(configured[0]?.args["modelSelection"]).toEqual({
+      instanceId: "own-account",
+      model: "opus",
+      options: [{ id: "effort", value: "high" }],
+    });
+    expect(calls.some((call) => call.tool === "t3_thread_configuration")).toBe(false);
+    expect(calls.some((call) => call.tool === "t3_thread_send")).toBe(true);
   });
 });
