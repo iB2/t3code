@@ -49,10 +49,13 @@
  *
  * Every verb that touches threads takes `--env <name>`.
  *
- * `open` sets the model's effort to `high` unless `--effort` says otherwise (it
- * needs `--account` to know the model; without one T3's project default
- * stands). `continue --effort` changes an existing thread's level from that
- * turn on. `read` reports the level a thread is set to.
+ * `open` sets the model's effort to `high` unless `--effort` says otherwise.
+ * It needs `--account` or `--instance` to see the model's levels. When that
+ * model does not offer the required level, `open` refuses and does not launch.
+ * Without an account the model is unknown, so `open` leaves T3's project
+ * default alone. `continue --effort` reads the current selection with
+ * `t3_thread_configure` (v0.1.7 has no `t3_thread_configuration`) and changes
+ * the level from that turn on. `read` reports the level a thread is set to.
  *
  * `open` gives each new thread its own worktree, branched from
  * `origin/<base>` (default `main`), so threads in the same project can run side
@@ -87,6 +90,7 @@ import {
   NEEDS_DECISION,
   assertInstanceAllowed,
   classifyMcpThread,
+  effortLevelsFor,
   settleRefusal,
   parsePolicy,
   projectVisible,
@@ -293,13 +297,8 @@ async function openSession(args) {
         models: p.models.map((m) => m.id),
       }));
   /** The reasoning levels a model offers here (its `effort` option), or [] if it has none. */
-  const effortLevels = async (instanceId, model) => {
-    const provider = (await allProviders()).find((p) => p.providerInstanceId === instanceId);
-    const option = (provider?.models ?? [])
-      .find((m) => m.id === model)
-      ?.options?.find((o) => o.id === "effort");
-    return (option?.options ?? []).map((o) => o.id);
-  };
+  const effortLevels = async (instanceId, model) =>
+    effortLevelsFor(await allProviders(), instanceId, model);
   const accountName = async (instanceId) =>
     (await allProviders()).find((p) => p.providerInstanceId === instanceId)?.displayName ??
     instanceId;
@@ -647,9 +646,13 @@ async function assertEffort(session, instanceId, model, effort) {
   }
 }
 
-/** The effort a thread is set to, as T3 recorded it. */
-async function threadEffort(session, threadId) {
-  const config = await session.mcp.call("t3_thread_configuration", { threadId });
+/**
+ * The effort a thread is set to, as T3 recorded it.
+ * `read` still asks `t3_thread_configuration`. `continue --effort` passes
+ * `t3_thread_configure`, the tool v0.1.7 exposes for this read.
+ */
+async function threadEffort(session, threadId, tool = "t3_thread_configuration") {
+  const config = await session.mcp.call(tool, { threadId });
   const option = (config.modelSelection?.options ?? []).find((o) => o.id === "effort");
   return option?.value ?? "model default";
 }
@@ -864,10 +867,10 @@ const VERBS = {
     }
     // Without options a model runs at its own default effort (medium for Opus
     // 5.5), not the level the app's composer is set to: the desktop settings
-    // never reach a thread opened over MCP. So `open` asks for DEFAULT_EFFORT
-    // unless told otherwise, whenever it knows the account and the model has
-    // that level. With no account it cannot know the model, so it leaves T3's
-    // project default alone.
+    // never reach a thread opened over MCP. When the account is known, `open`
+    // requires DEFAULT_EFFORT and refuses instead of launching without it.
+    // With no account the model is unknown, so this command cannot attach an
+    // effort it has not checked.
     let effort;
     if (args.effort !== undefined) {
       if (modelSelection?.instanceId === undefined)
@@ -876,7 +879,12 @@ const VERBS = {
       effort = args.effort;
     } else if (modelSelection?.instanceId !== undefined) {
       const levels = await session.effortLevels(modelSelection.instanceId, modelSelection.model);
-      if (levels.includes(DEFAULT_EFFORT)) effort = DEFAULT_EFFORT;
+      if (!levels.includes(DEFAULT_EFFORT)) {
+        throw new ChairRefusal(
+          `refused: open requires effort '${DEFAULT_EFFORT}' and ${modelSelection.model} offers ${levels.join(", ") || "no effort setting"}`,
+        );
+      }
+      effort = DEFAULT_EFFORT;
     }
     if (effort !== undefined) {
       modelSelection = { ...modelSelection, options: [{ id: "effort", value: effort }] };
@@ -952,7 +960,7 @@ const VERBS = {
     // it holds for this turn and the ones after it.
     let selection;
     if (args.effort !== undefined) {
-      const config = await session.mcp.call("t3_thread_configuration", { threadId: row.id });
+      const config = await session.mcp.call("t3_thread_configure", { threadId: row.id });
       selection = config.modelSelection ?? {};
       await assertEffort(session, selection.instanceId, selection.model, args.effort);
     }
@@ -981,7 +989,11 @@ const VERBS = {
       return {
         threadId: row.id,
         started: true,
-        effort: await threadEffort(session, row.id),
+        effort: await threadEffort(
+          session,
+          row.id,
+          args.effort === undefined ? "t3_thread_configuration" : "t3_thread_configure",
+        ),
         url: await session.url(row.id),
       };
     });

@@ -103,6 +103,51 @@ export function threadVisible(policy: ChairPolicy, thread: Row): boolean {
   return instanceId !== "" && !policy.blockedInstanceIds.includes(instanceId);
 }
 
+function asRecord(value: unknown): Row | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Row;
+}
+
+/**
+ * Effort levels a capabilities model option offers.
+ *
+ * v0.1.7 sends `{ id: "effort", values: ["low", "medium", "high"] }`. An older
+ * payload used `{ id: "effort", options: [{ id: "high" }] }`. String entries in
+ * `values` win. Booleans in that list are not level names, so a boolean-only
+ * list falls through to the nested ids.
+ */
+export function effortLevelIds(option: unknown): ReadonlyArray<string> {
+  const record = asRecord(option);
+  if (record === undefined) return [];
+  const fromValues = Array.isArray(record["values"])
+    ? record["values"].filter((value): value is string => typeof value === "string" && value !== "")
+    : [];
+  if (fromValues.length > 0) return fromValues;
+  if (!Array.isArray(record["options"])) return [];
+  return record["options"].flatMap((entry) => {
+    const id = asRecord(entry)?.["id"];
+    return typeof id === "string" && id !== "" ? [id] : [];
+  });
+}
+
+/** The `effort` levels one provider model lists, or [] when it lists none. */
+export function effortLevelsFor(
+  providers: ReadonlyArray<unknown>,
+  instanceId: string,
+  model: string,
+): ReadonlyArray<string> {
+  const provider = providers.find(
+    (entry) => asRecord(entry)?.["providerInstanceId"] === instanceId,
+  );
+  const models = asRecord(provider)?.["models"];
+  if (!Array.isArray(models)) return [];
+  const match = models.find((entry) => asRecord(entry)?.["id"] === model);
+  const options = asRecord(match)?.["options"];
+  if (!Array.isArray(options)) return [];
+  const effort = options.find((entry) => asRecord(entry)?.["id"] === "effort");
+  return effortLevelIds(effort);
+}
+
 /** Refuse an instance the policy keeps local (for `open --instance`). */
 export function assertInstanceAllowed(policy: ChairPolicy, instanceId: string): void {
   if (policy.blockedInstanceIds.includes(instanceId)) {

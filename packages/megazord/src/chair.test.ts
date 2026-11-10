@@ -5,6 +5,8 @@ import {
   assertInstanceAllowed,
   classifyMcpThread,
   classifyThread,
+  effortLevelIds,
+  effortLevelsFor,
   parsePolicy,
   pendingApprovals,
   projectVisible,
@@ -213,5 +215,41 @@ describe("a queue held after the last turn ended", () => {
   it("keeps a new thread whose first run is still queued as running", () => {
     const fresh = { ...held, latestRunId: "run:1", runCount: 1, recentRuns: [held.recentRuns[0]] };
     expect(classifyMcpThread(fresh).status).toBe("running");
+  });
+});
+
+describe("effortLevelIds", () => {
+  it("reads v0.1.7 values and ignores booleans", () => {
+    expect(effortLevelIds({ id: "effort", values: ["low", "medium", "high", false] })).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+  });
+
+  it("reads nested option ids when values are absent", () => {
+    expect(
+      effortLevelIds({ id: "effort", options: [{ id: "low" }, { id: "high" }, { label: "no" }] }),
+    ).toEqual(["low", "high"]);
+  });
+
+  it("prefers values strings, and falls back when values holds only booleans", () => {
+    expect(effortLevelIds({ id: "effort", values: ["high"], options: [{ id: "low" }] })).toEqual([
+      "high",
+    ]);
+    expect(
+      effortLevelIds({ id: "effort", values: [false, true], options: [{ id: "high" }] }),
+    ).toEqual(["high"]);
+  });
+
+  it("finds effort on the provider model", () => {
+    const providers = [
+      {
+        providerInstanceId: "own-account",
+        models: [{ id: "opus", options: [{ id: "effort", values: ["high", "xhigh"] }] }],
+      },
+    ];
+    expect(effortLevelsFor(providers, "own-account", "opus")).toEqual(["high", "xhigh"]);
+    expect(effortLevelsFor(providers, "own-account", "other")).toEqual([]);
   });
 });
